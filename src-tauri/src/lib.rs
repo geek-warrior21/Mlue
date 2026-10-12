@@ -1,6 +1,10 @@
 pub mod api;
+pub mod providers;
+pub mod registry;
 pub mod runtime;
 
+use providers::ollama::{DEFAULT_OLLAMA_ENDPOINT, OllamaProvider};
+use registry::{DiscoveredModelsResponse, ModelRegistry};
 use runtime::server::{DEFAULT_HOST, DEFAULT_PORT, default_endpoint, run_server};
 use runtime::state::{AppState, RuntimeStatus};
 use std::sync::Arc;
@@ -12,6 +16,19 @@ fn get_runtime_status(state: State<'_, Arc<AppState>>) -> RuntimeStatus {
     state.get_status()
 }
 
+#[tauri::command]
+fn get_discovered_models(registry: State<'_, Arc<ModelRegistry>>) -> DiscoveredModelsResponse {
+    registry.get_snapshot()
+}
+
+#[tauri::command]
+async fn refresh_ollama(
+    registry: State<'_, Arc<ModelRegistry>>,
+    provider: State<'_, Arc<OllamaProvider>>,
+) -> Result<DiscoveredModelsResponse, String> {
+    Ok(registry.refresh(&*provider).await)
+}
+
 pub struct ServerShutdownHandle {
     pub tx: watch::Sender<bool>,
 }
@@ -20,20 +37,43 @@ pub struct ServerShutdownHandle {
 pub fn run() {
     let initial_status = RuntimeStatus::starting(default_endpoint());
     let app_state = Arc::new(AppState::new(initial_status));
+    let model_registry = Arc::new(ModelRegistry::new());
+    let ollama_provider = Arc::new(OllamaProvider::new(DEFAULT_OLLAMA_ENDPOINT));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let state_for_server = app_state.clone();
     let state_for_tauri = app_state.clone();
+    let registry_for_tauri = model_registry.clone();
+    let registry_for_init = model_registry.clone();
+    let provider_for_tauri = ollama_provider.clone();
+    let provider_for_init = ollama_provider.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
 
     let builder = tauri::Builder::default()
         .manage(state_for_tauri)
+        .manage(registry_for_tauri)
+        .manage(provider_for_tauri)
         .manage(ServerShutdownHandle { tx: shutdown_tx })
-        .invoke_handler(tauri::generate_handler![get_runtime_status])
-        .setup(move |_app| {
+        .invoke_handler(tauri::generate_handler![
+            get_runtime_status,
+            get_discovered_models,
+            refresh_ollama
+        ])
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+
+            // 1. Spawn embedded Axum HTTP server
             tauri::async_runtime::spawn(async move {
                 let _ = run_server(DEFAULT_HOST, DEFAULT_PORT, state_for_server, shutdown_rx).await;
             });
+
+            // 2. Spawn initial asynchronous Ollama model discovery and emit event
+            tauri::async_runtime::spawn(async move {
+                use tauri::Emitter;
+                let snapshot = registry_for_init.refresh(&*provider_for_init).await;
+                let _ = app_handle.emit("models-updated", &snapshot);
+            });
+
             Ok(())
         });
 

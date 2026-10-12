@@ -22,9 +22,8 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 http-body-util = "0.1"
 thiserror = "2"
-
-[dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [profile.release]
 codegen-units = 1

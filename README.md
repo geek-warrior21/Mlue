@@ -6,16 +6,24 @@ mlue is a local-first desktop application that allows users to expose supported 
 
 ---
 
-## Current Milestone: Brick 0 — Application Foundation
+## Current Milestones
 
-Brick 0 establishes the native application bootstrap, embedded server runtime, and inter-process communication foundation:
-
+### Brick 0 — Application Foundation
 - **Native Tauri 2 Desktop Shell**: Cross-platform desktop application powered by Rust and modern web standards.
 - **Embedded Axum HTTP Server**: Asynchronous HTTP server running inside the desktop process, listening strictly on `127.0.0.1:4782`.
-- **Health Check Endpoint**: `GET /health` returning service metadata, status, and dynamic versioning.
-- **Tauri IPC Runtime Status**: Real-time status inspection (`starting`, `running`, `error`, `stopped`) queried via Tauri IPC commands.
-- **Port Conflict & Error Resilience**: Graceful error handling for port collisions without crashing the desktop user interface.
+- **Health Check Endpoint**: `GET /health` returning service metadata, status, and dynamic package versioning.
+- **Tauri IPC Runtime Status**: Real-time status inspection (`starting`, `running`, `error`, `stopped`) queried via Tauri IPC command `get_runtime_status`.
+- **Port Conflict Resilience**: Graceful error handling for port collisions without crashing the desktop user interface.
 - **Controlled Lifecycle Shutdown**: Orderly asynchronous cleanup when the application exits.
+
+### Brick 1 — Ollama Auto-Discovery & Model Registry
+- **Ollama Service Discovery**: Automatic non-blocking detection of locally running Ollama instances on `http://127.0.0.1:11434`.
+- **Provider-Agnostic Model Metadata**: Normalized `ModelInfo` and `ModelCapabilities` models preserving upstream model names, namespace tags, parameter counts, and quantization levels.
+- **In-Memory Model Registry**: Concurrency-safe registry with atomic snapshot updates and offline state invalidation.
+- **Tauri IPC Discovery Commands**:
+  - `get_discovered_models`: Instant retrieval of in-memory model snapshot without network blocking.
+  - `refresh_ollama`: User-triggered asynchronous discovery refresh with connection serialization.
+- **Desktop UI Local Models Section**: Interactive visual status indicating `checking`, `ready` (with model cards), `no_models`, `unreachable`, or `error` with manual Refresh action.
 
 ---
 
@@ -80,20 +88,19 @@ You can also test the endpoint directly from the desktop UI using the **Test** a
 
 ## What is NOT Implemented Yet (Planned for Future Bricks)
 
-The following capabilities are deliberately out of scope for Brick 0:
+The following capabilities are deliberately out of scope for Brick 0 and Brick 1:
 
-- AI model detection or local inference (Ollama, llama.cpp, etc.)
-- Cloud provider connections (OpenAI, Gemini, Anthropic)
+- `/v1/chat/completions` or `/v1/models` public reverse proxy
+- Model execution or prompt generation
 - API key generation and management
-- OpenAI-compatible inference endpoints (`/v1/chat/completions`)
-- Model routing or prompt proxying
-- Database persistence (SQLite)
+- Cloud provider connections (OpenAI, Gemini, Anthropic)
+- SQLite database integration
 - Public networking / remote tunnels (Tailscale)
-- Authentication workflows
+- Model downloading/pulling workflows
 - System tray integration
 
 ---
 
-## Architecture
+## Architecture & Guidelines
 
-For details on the embedded runtime lifecycle and security model, refer to [ARCHITECTURE.md](docs/ARCHITECTURE.md). For engineering invariants and contribution guidelines, see [AGENTS.md](AGENTS.md).
+For details on the embedded runtime lifecycle and discovery registry, refer to [ARCHITECTURE.md](docs/ARCHITECTURE.md). For progress history, see [PROGRESS.md](docs/PROGRESS.md). For engineering invariants, see [AGENTS.md](AGENTS.md).
