@@ -1,9 +1,16 @@
+pub mod manager;
 pub mod types;
 
-pub use types::{ChatMessage, InferenceRequest, InferenceResponse, MessageRole, UsageInfo};
+pub use manager::{InferenceManager, TerminalGuard};
+pub use types::{
+    ChatMessage, InferenceEvent, InferenceRequest, InferenceResponse, MessageRole, UsageInfo,
+};
 
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceError {
@@ -33,6 +40,9 @@ pub enum InferenceError {
 
     #[error("The AI model failed to load or run: {0}")]
     ModelLoadFailure(String),
+
+    #[error("Inference request was cancelled")]
+    Cancelled,
 
     #[error("Inference failure: {0}")]
     Other(String),
@@ -115,6 +125,9 @@ impl From<InferenceError> for InferenceErrorPayload {
                 "The AI model failed to load or run. Please verify your system resources.",
                 Some(details),
             ),
+            InferenceError::Cancelled => {
+                InferenceErrorPayload::new("CANCELLED", "Generation was cancelled.", None)
+            }
             InferenceError::Other(details) => InferenceErrorPayload::new(
                 "INTERNAL_ERROR",
                 "An unexpected error occurred during inference.",
@@ -124,11 +137,20 @@ impl From<InferenceError> for InferenceErrorPayload {
     }
 }
 
+pub type InferenceEventStream =
+    Pin<Box<dyn Stream<Item = Result<InferenceEvent, InferenceError>> + Send>>;
+
 pub trait ModelInference: Send + Sync {
     fn generate(
         &self,
         request: InferenceRequest,
     ) -> impl std::future::Future<Output = Result<InferenceResponse, InferenceError>> + Send;
+
+    fn stream(
+        &self,
+        request: InferenceRequest,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<InferenceEventStream, InferenceError>> + Send;
 }
 
 impl<T: ModelInference + ?Sized> ModelInference for std::sync::Arc<T> {
@@ -137,5 +159,14 @@ impl<T: ModelInference + ?Sized> ModelInference for std::sync::Arc<T> {
         request: InferenceRequest,
     ) -> impl std::future::Future<Output = Result<InferenceResponse, InferenceError>> + Send {
         (**self).generate(request)
+    }
+
+    fn stream(
+        &self,
+        request: InferenceRequest,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<InferenceEventStream, InferenceError>> + Send
+    {
+        (**self).stream(request, cancellation_token)
     }
 }

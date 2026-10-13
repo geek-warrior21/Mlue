@@ -34,6 +34,15 @@ mlue is a local-first desktop application that allows users to expose supported 
 - **Desktop AI Playground**: Interactive UI in the desktop app with live model selection, prompt input, generation loading indicator, duration metrics, and structured error display.
 - **Security Boundaries**: Strictly local execution; no unauthenticated public inference HTTP endpoints are exposed.
 
+### Brick 2B — Real-Time Inference Streaming & Cancellation
+- **Canonical Streaming Event Pipeline**: Provider-independent `InferenceEvent` (`Started`, `Delta`, `Completed`, `Cancelled`, `Error`) with guaranteed single terminal event semantics via atomic CAS `TerminalGuard`.
+- **Tauri 2 IPC Channels**: Fast, direct token streaming via typed `Channel<InferenceEvent>` directly targeting the requesting window.
+- **Incremental NDJSON Parser**: Stream parser handling byte fragments, split NDJSON objects, split multi-byte UTF-8 code points, blank lines, bounded buffering (64 KiB line limit), and premature EOF detection. User-facing content is extracted strictly from `message.content` without mixing thinking fields.
+- **Real-Time Request Cancellation**: `cancel_test_completion` terminates in-flight inference, drops upstream Reqwest HTTP streams to abort the underlying network connection, releases concurrency permits, and marks status as `Cancelled`.
+- **Concurrency & Semaphore Management**: Backend-wide semaphore (max 2 active inference jobs) with automatic permit reclamation.
+- **Decoupled Timeout Policy**: Decoupled connection (5s), initial response (30s), idle token (15s), and overall generation (300s) timeouts.
+- **React Playground Streaming Experience**: Real-time token rendering with throttled UI frame updates, live Stop Generation button, latency metrics, and component unmount cleanup.
+
 ---
 
 ## Prerequisites
@@ -96,9 +105,8 @@ Expected response (`HTTP/1.1 200 OK`):
 
 ## What is NOT Implemented Yet (Planned for Future Bricks)
 
-The following capabilities are deliberately out of scope for Brick 2A:
+The following capabilities are deliberately out of scope for Brick 2B:
 
-- Streaming generation and Server-Sent Events (SSE) (deferred to Brick 2B)
 - Public `/v1/chat/completions` or `/v1/models` HTTP endpoints (Brick 4)
 - API key generation and management (Brick 3)
 - SQLite database integration (Brick 3)

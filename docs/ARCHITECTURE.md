@@ -243,7 +243,148 @@ All errors are mapped into strongly-typed `InferenceError` variants and converte
 
 Raw user prompts and provider internals are never leaked in error payloads or default logs.
 
-### 5.7 Current Limitations
-- Single-turn and multi-turn completion is currently buffered (`stream: false`). Streaming generation (SSE) is deferred to Brick 2B.
+### 5.7 Current Limitations (Brick 2A)
 - Public HTTP inference (`/v1/chat/completions`) is intentionally disabled; inference is accessible exclusively via Tauri desktop IPC.
 - API key authentication and multi-user quota enforcement are scheduled for Brick 3.
+
+---
+
+## 6. Real-Time Inference Streaming & Cancellation (Brick 2B)
+
+Brick 2B introduces token-by-token streaming from local Ollama into the desktop Test Playground using Tauri 2 IPC Channels, provider-independent streaming event contracts, atomic cancellation mechanics, decoupled timeouts, and concurrency controls.
+
+### 6.1 Streaming Pipeline
+
+```
+React Playground (App.tsx)
+      │
+      │ 1. Tauri Channel callback registered
+      │ 2. invoke('start_test_stream', { request_id, model_id, messages, on_event })
+      ▼
+Tauri IPC Command Handler (lib.rs)
+      │
+      │ 3. Validate input boundaries (50 msgs, 64 KiB/msg, 128 KiB total)
+      │ 4. Acquire concurrency permit (InferenceManager semaphore: max 2 tasks)
+      │ 5. Register active CancellationToken & TerminalGuard
+      ▼
+InferenceManager & ModelRegistry (registry/mod.rs)
+      │
+      │ 6. Resolve upstream model, check capabilities (cached, locks dropped)
+      ▼
+Ollama Streaming Driver (providers/ollama.rs)
+      │
+      │ 7. POST http://127.0.0.1:11434/api/chat with {"stream": true}
+      │ 8. Receive raw byte chunks from Reqwest response stream
+      ▼
+Incremental NDJSON Parser (providers/ollama.rs)
+      │
+      │ • Bounded byte-buffer (max 64 KiB line limit)
+      │ • Slices on '\n' boundary (guarantees split UTF-8 safety)
+      │ • Parses Ollama chat chunk: message.content (ignores separate thinking fields)
+      │ • Detects premature EOF without done: true
+      │ • Extracts token usage (prompt_eval_count, eval_count)
+      ▼
+Canonical Stream Events (InferenceEvent)
+      │
+      │ [Started, Delta*, Completed | Cancelled | Error]
+      ▼
+TerminalGuard (inference/manager.rs)
+      │
+      │ • Atomic CAS: guarantees exactly one terminal event per request
+      ▼
+Tauri 2 IPC Channel (Channel<InferenceEvent>)
+      │
+      │ • Direct per-window IPC channel delivery (no global event bus)
+      ▼
+React Desktop Playground (App.tsx)
+        • Incremental token rendering with throttled state batching (20ms)
+        • Real-time Stop Generation button triggering invoke('cancel_test_completion')
+```
+
+### 6.2 Canonical Streaming Event Contract
+
+Streaming events are strictly provider-agnostic and serialized with a tagged `type` field:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InferenceEvent {
+    Started {
+        request_id: String,
+        model_id: String,
+    },
+    Delta {
+        request_id: String,
+        content: String,
+    },
+    Completed {
+        request_id: String,
+        model_id: String,
+        usage: Option<UsageInfo>,
+        duration_ms: u64,
+        finish_reason: Option<String>,
+    },
+    Cancelled {
+        request_id: String,
+    },
+    Error {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+}
+```
+
+#### Event Invariants:
+1. **Identifier Attribution**: Every event carries the unique `request_id`.
+2. **Exactly One Terminal Event**: Every request concludes with exactly one terminal event: `Completed`, `Cancelled`, or `Error`.
+3. **No Post-Terminal Emission**: Once a terminal event is sent, no further `Delta` or status events are emitted for that request.
+4. **Chronological Ordering**: Chronological token ordering is strictly preserved.
+5. **No Provider Leaks**: Provider-specific fields (e.g. Ollama's internal timestamp numbers or chunk headers) are transformed into canonical fields.
+
+### 6.3 Native Ollama Incremental NDJSON Parser
+
+Ollama returns newline-delimited JSON (`\n` separated JSON objects). The stream parser (`providers/ollama.rs`):
+- **Bounded Buffering**: Accumulates incoming byte chunks into a `Vec<u8>` buffer with a hard 64 KiB ceiling per incomplete line. If an upstream chunk exceeds 64 KiB without a newline, it fails with `MalformedResponse`.
+- **Split UTF-8 Handling**: Because multi-byte UTF-8 sequences never contain the ASCII newline byte `0x0A` (`\n`), slicing incoming bytes strictly on `\n` boundaries before UTF-8 decoding guarantees that multi-byte code points split across network packet boundaries assemble without corruption.
+- **Message Content Extraction**: User-facing text is extracted exclusively from `message.content`. Any non-message or separate reasoning/thinking fields are not mixed into the displayed text delta.
+- **Usage & Metadata Extraction**: When Ollama emits `done: true`, `prompt_eval_count` and `eval_count` are captured into `UsageInfo`, and `done_reason` is captured into `finish_reason`.
+- **Premature EOF Detection**: If the upstream byte stream ends without emitting a `done: true` object, the parser emits an explicit `InferenceError::MalformedResponse("Premature EOF: stream closed without completion event")`.
+
+### 6.4 Concurrency Control & Semaphore
+
+- `InferenceManager` maintains an internal `tokio::sync::Semaphore` bounding active concurrent inference jobs across the desktop application (default limit: 2 concurrent tasks).
+- Permits are acquired before registration and automatically returned on normal completion, cancellation, provider errors, timeouts, or channel teardown via RAII.
+- Frontend playground restricts concurrent submissions per window; backend rejects excess jobs with `InferenceError::InvalidRequest("Maximum concurrent inference jobs reached")`.
+
+### 6.5 Cancellation Architecture & Upstream Connection Abort
+
+1. **Initiation**: The frontend calls `cancel_test_completion({ request_id })`.
+2. **Handle Lookup**: `InferenceManager` locates the active request's `CancellationToken` in its concurrent registry.
+3. **Cancellation Trigger**: `token.cancel()` is triggered.
+4. **Upstream Abort**: In the async worker task, `tokio::select!` branches on `token.cancelled()`. The active `response.bytes_stream()` is immediately dropped. Dropping the Reqwest response stream terminates the underlying TCP socket connection to Ollama immediately.
+5. **Permit Release**: The RAII concurrency permit is dropped.
+6. **Single Terminal Event Enforcement**: A `TerminalGuard` uses atomic compare-and-swap (`AtomicU8`) to guarantee that `Cancelled` is emitted if and only if neither `Completed` nor `Error` has already fired.
+7. **Cleanup**: Active request tracking is purged from `InferenceManager`.
+
+### 6.6 Decoupled Timeout Policy
+
+To support long-running generative tasks while preventing hung workers, timeouts are strictly decoupled:
+- **Connection Timeout**: 5 seconds (establishing initial TCP connection to Ollama).
+- **Initial Response Timeout**: 30 seconds (waiting for Ollama to load the model into memory/VRAM and emit the first byte chunk).
+- **Idle Stream Timeout**: 15 seconds (maximum allowable silence between consecutive token chunks).
+- **Overall Generation Timeout**: 300 seconds (5 minutes total generation limit).
+
+Cancellation signals interrupt timeout waits immediately via Tokio select.
+
+### 6.7 Input Boundary Protections
+
+All inference requests are validated before acquiring concurrency permits or making network calls:
+- Maximum chat messages: 50.
+- Maximum single message content: 64 KiB (65,536 bytes UTF-8).
+- Maximum total combined message content: 128 KiB (131,072 bytes UTF-8).
+
+### 6.8 Known Limitations (Brick 2B)
+- Public HTTP inference (`/v1/chat/completions`) remains disabled; inference is strictly accessible via internal desktop Tauri IPC.
+- Model downloading/pulling workflows are out of scope.
+- Multi-user credentials and API keys are scheduled for Brick 3.

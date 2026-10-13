@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 export type ServerState = "starting" | "running" | "error" | "stopped";
@@ -66,6 +66,22 @@ export interface InferenceErrorState {
   technical_details?: string | null;
 }
 
+export type InferenceEventType =
+  | { type: "started"; request_id: string; model_id: string }
+  | { type: "delta"; request_id: string; content: string }
+  | {
+      type: "completed";
+      request_id: string;
+      model_id: string;
+      usage?: UsageInfo | null;
+      duration_ms: number;
+      finish_reason?: string | null;
+    }
+  | { type: "cancelled"; request_id: string }
+  | { type: "error"; request_id: string; code: string; message: string };
+
+export type GenerationStatus = "idle" | "generating" | "completed" | "cancelled" | "error";
+
 function formatBytes(bytes: number | null): string | null {
   if (bytes == null || bytes === 0) return null;
   const k = 1024;
@@ -93,12 +109,20 @@ export default function App() {
   const [discoveryLoading, setDiscoveryLoading] = useState<boolean>(true);
   const [isRefreshingOllama, setIsRefreshingOllama] = useState<boolean>(false);
 
-  // Playground State (Brick 2A)
+  // Playground State (Brick 2A & 2B)
   const [selectedModelId, setSelectedModelId] = useState<string>("");
   const [promptText, setPromptText] = useState<string>("");
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [generationStatus, setGenerationStatus] = useState<GenerationStatus>("idle");
+  const [activeModelId, setActiveModelId] = useState<string>("");
+  const [streamedContent, setStreamedContent] = useState<string>("");
   const [generationResult, setGenerationResult] = useState<InferenceResult | null>(null);
   const [generationError, setGenerationError] = useState<InferenceErrorState | null>(null);
+  const [isStreamingMode, setIsStreamingMode] = useState<boolean>(true);
+
+  const activeRequestIdRef = useRef<string | null>(null);
+  const contentBufferRef = useRef<string>("");
+  const batchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Fetch Runtime Status via IPC
   const fetchStatus = useCallback(async () => {
@@ -255,6 +279,32 @@ export default function App() {
     setTimeout(() => setCopiedKey(null), 2000);
   };
 
+  // Cancel active inference operation
+  const handleCancel = useCallback(async () => {
+    const reqId = activeRequestIdRef.current;
+    if (!reqId) return;
+
+    try {
+      if (isTauri()) {
+        await invoke("cancel_test_completion", { request_id: reqId });
+      }
+    } catch (err) {
+      console.error("Cancel failed:", err);
+    }
+  }, []);
+
+  // Cleanup active request handling on unmount
+  useEffect(() => {
+    return () => {
+      if (activeRequestIdRef.current && isTauri()) {
+        invoke("cancel_test_completion", { request_id: activeRequestIdRef.current }).catch(() => {});
+      }
+      if (batchTimerRef.current) {
+        clearTimeout(batchTimerRef.current);
+      }
+    };
+  }, []);
+
   // Execute inference in AI Playground
   const handleGenerate = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -262,49 +312,149 @@ export default function App() {
 
     const targetModelId = selectedModelId;
     const userPrompt = promptText.trim();
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
     setIsGenerating(true);
+    setGenerationStatus("generating");
+    setActiveModelId(targetModelId);
+    setStreamedContent("");
+    setGenerationResult(null);
     setGenerationError(null);
+    activeRequestIdRef.current = requestId;
+    contentBufferRef.current = "";
 
-    try {
-      if (isTauri()) {
+    if (!isTauri()) {
+      setGenerationStatus("error");
+      setGenerationError({
+        code: "TAURI_UNAVAILABLE",
+        message: "Desktop inference requires running inside the Tauri native app.",
+        technical_details: "Web preview mode cannot invoke native IPC.",
+      });
+      setIsGenerating(false);
+      activeRequestIdRef.current = null;
+      return;
+    }
+
+    if (isStreamingMode) {
+      try {
+        const channel = new Channel<InferenceEventType>((event) => {
+          // Ignore events that do not match the active request ID
+          if (event.request_id !== activeRequestIdRef.current) return;
+
+          switch (event.type) {
+            case "started":
+              break;
+
+            case "delta": {
+              contentBufferRef.current += event.content;
+              if (!batchTimerRef.current) {
+                batchTimerRef.current = setTimeout(() => {
+                  setStreamedContent(contentBufferRef.current);
+                  batchTimerRef.current = null;
+                }, 20);
+              }
+              break;
+            }
+
+            case "completed": {
+              if (batchTimerRef.current) {
+                clearTimeout(batchTimerRef.current);
+                batchTimerRef.current = null;
+              }
+              const finalContent = contentBufferRef.current;
+              setStreamedContent(finalContent);
+              setGenerationResult({
+                model_id: event.model_id,
+                content: finalContent,
+                finish_reason: event.finish_reason,
+                usage: event.usage,
+                duration_ms: event.duration_ms,
+              });
+              setGenerationStatus("completed");
+              setIsGenerating(false);
+              activeRequestIdRef.current = null;
+              break;
+            }
+
+            case "cancelled": {
+              if (batchTimerRef.current) {
+                clearTimeout(batchTimerRef.current);
+                batchTimerRef.current = null;
+              }
+              setStreamedContent(contentBufferRef.current);
+              setGenerationStatus("cancelled");
+              setIsGenerating(false);
+              activeRequestIdRef.current = null;
+              break;
+            }
+
+            case "error": {
+              if (batchTimerRef.current) {
+                clearTimeout(batchTimerRef.current);
+                batchTimerRef.current = null;
+              }
+              setStreamedContent(contentBufferRef.current);
+              setGenerationError({
+                code: event.code,
+                message: event.message,
+              });
+              setGenerationStatus("error");
+              setIsGenerating(false);
+              activeRequestIdRef.current = null;
+              break;
+            }
+          }
+        });
+
+        // Register channel callback before invoking command
+        await invoke("start_test_stream", {
+          request_id: requestId,
+          model_id: targetModelId,
+          messages: [
+            {
+              role: "user",
+              content: userPrompt,
+            },
+          ],
+          on_event: channel,
+        });
+      } catch (err: unknown) {
+        console.error("Stream start failed:", err);
+        const payload = err as { code?: string; message?: string; technical_details?: string } | undefined;
+        setGenerationError({
+          code: payload?.code || "STREAM_START_FAILED",
+          message: payload?.message || "Failed to start inference stream.",
+          technical_details: payload?.technical_details || String(err),
+        });
+        setGenerationStatus("error");
+        setIsGenerating(false);
+        activeRequestIdRef.current = null;
+      }
+    } else {
+      // Non-streaming fallback
+      try {
         const response = await invoke<InferenceResult>("generate_test_completion", {
           request: {
             model_id: targetModelId,
-            messages: [
-              {
-                role: "user",
-                content: userPrompt,
-              },
-            ],
+            messages: [{ role: "user", content: userPrompt }],
           },
         });
+        setStreamedContent(response.content);
         setGenerationResult(response);
-      } else {
+        setGenerationStatus("completed");
+      } catch (err: unknown) {
+        console.error("Inference failed:", err);
+        const payload = err as { code?: string; message?: string; technical_details?: string } | undefined;
         setGenerationError({
-          code: "TAURI_UNAVAILABLE",
-          message: "Desktop inference requires running inside the Tauri native app.",
-          technical_details: "Web preview mode cannot invoke native IPC.",
+          code: payload?.code || "INFERENCE_ERROR",
+          message: payload?.message || "Failed to generate completion.",
+          technical_details: payload?.technical_details || null,
         });
+        setGenerationStatus("error");
+      } finally {
+        setIsGenerating(false);
+        activeRequestIdRef.current = null;
       }
-    } catch (err: unknown) {
-      console.error("Inference failed:", err);
-      if (err && typeof err === "object" && "message" in err) {
-        const payload = err as { code?: string; message?: string; technical_details?: string };
-        setGenerationError({
-          code: payload.code || "INFERENCE_ERROR",
-          message: payload.message || "Failed to generate completion.",
-          technical_details: payload.technical_details || null,
-        });
-      } else {
-        setGenerationError({
-          code: "UNKNOWN_ERROR",
-          message: typeof err === "string" ? err : "Inference failed unexpectedly.",
-          technical_details: null,
-        });
-      }
-    } finally {
-      setIsGenerating(false);
     }
   };
 
@@ -540,31 +690,58 @@ export default function App() {
               </div>
             </div>
 
-            {/* Generate Action Button */}
-            <div className="flex items-center justify-end gap-3">
-              <button
-                type="submit"
-                id="generate-response-btn"
-                disabled={!hasAvailableModels || isGenerating || !promptText.trim()}
-                className="inline-flex items-center gap-2 px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:bg-zinc-800 disabled:text-zinc-500 text-white text-xs font-semibold transition-all cursor-pointer disabled:cursor-not-allowed shadow-md shadow-indigo-900/20"
-              >
-                {isGenerating ? (
-                  <>
-                    <svg className="w-3.5 h-3.5 animate-spin text-white" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+            {/* Action Buttons: Generate & Stop Generation */}
+            <div className="flex items-center justify-between gap-3">
+              <label className="flex items-center gap-2 cursor-pointer text-[11px] text-zinc-400 select-none">
+                <input
+                  type="checkbox"
+                  checked={isStreamingMode}
+                  onChange={(e) => setIsStreamingMode(e.target.checked)}
+                  disabled={isGenerating}
+                  className="rounded border-zinc-700 bg-zinc-900 text-indigo-600 focus:ring-0 cursor-pointer"
+                />
+                <span>Stream response in real time</span>
+              </label>
+
+              <div className="flex items-center gap-2">
+                {isGenerating && (
+                  <button
+                    type="button"
+                    id="stop-generation-btn"
+                    onClick={handleCancel}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white text-xs font-semibold transition-all cursor-pointer shadow-md shadow-rose-900/20"
+                  >
+                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                     </svg>
-                    <span>Generating Response...</span>
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                    </svg>
-                    <span>Generate Response</span>
-                  </>
+                    <span>Stop Generation</span>
+                  </button>
                 )}
-              </button>
+
+                <button
+                  type="submit"
+                  id="generate-response-btn"
+                  disabled={!hasAvailableModels || isGenerating || !promptText.trim()}
+                  className="inline-flex items-center gap-2 px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:bg-zinc-800 disabled:text-zinc-500 text-white text-xs font-semibold transition-all cursor-pointer disabled:cursor-not-allowed shadow-md shadow-indigo-900/20"
+                >
+                  {isGenerating ? (
+                    <>
+                      <svg className="w-3.5 h-3.5 animate-spin text-white" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                      <span>Generating...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                      <span>Generate Response</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           </form>
 
@@ -589,17 +766,46 @@ export default function App() {
           )}
 
           {/* Playground Response Display */}
-          {generationResult && (
+          {(streamedContent || generationResult || isGenerating || generationStatus === "cancelled") && (
             <div
               id="playground-response-display"
               className="mt-4 p-4 rounded-xl bg-zinc-950/90 border border-zinc-800/90 transition-all space-y-3"
             >
               <div className="flex items-center justify-between border-b border-zinc-800/80 pb-2.5">
-                <span className="text-xs font-semibold text-zinc-300">Response:</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-zinc-300">Response:</span>
+                  {generationStatus === "generating" && (
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 animate-pulse">
+                      <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-ping" />
+                      Streaming...
+                    </span>
+                  )}
+                  {generationStatus === "completed" && (
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                      Completed
+                    </span>
+                  )}
+                  {generationStatus === "cancelled" && (
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                      Generation stopped
+                    </span>
+                  )}
+                  {generationStatus === "error" && (
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/20">
+                      <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
+                      Inference error
+                    </span>
+                  )}
+                </div>
+
                 <button
+                  type="button"
                   id="copy-response-btn"
-                  onClick={() => copyToClipboard(generationResult.content, "response")}
-                  className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer"
+                  disabled={isGenerating || !streamedContent}
+                  onClick={() => copyToClipboard(streamedContent, "response")}
+                  className="text-xs text-zinc-400 hover:text-indigo-400 disabled:opacity-40 disabled:hover:text-zinc-400 transition-colors cursor-pointer"
                 >
                   {copiedKey === "response" ? <span className="text-emerald-400">Copied</span> : "Copy"}
                 </button>
@@ -607,9 +813,16 @@ export default function App() {
 
               <div
                 id="playground-response-content"
-                className="text-xs leading-relaxed text-zinc-200 whitespace-pre-wrap font-sans"
+                className="text-xs leading-relaxed text-zinc-200 whitespace-pre-wrap font-sans min-h-[2.5rem]"
               >
-                {generationResult.content}
+                {streamedContent || (isGenerating ? (
+                  <span className="text-zinc-500 italic">Waiting for initial token...</span>
+                ) : (
+                  <span className="text-zinc-500 italic">No output</span>
+                ))}
+                {isGenerating && (
+                  <span className="inline-block w-1.5 h-3.5 bg-indigo-400 ml-0.5 align-middle animate-pulse" />
+                )}
               </div>
 
               <div className="pt-2 border-t border-zinc-800/60 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-zinc-400">
@@ -617,17 +830,27 @@ export default function App() {
                   <span>
                     Model:{" "}
                     <strong className="text-indigo-300 font-semibold">
-                      {generationResult.model_id.replace(/^ollama\//, "")}
+                      {(activeModelId || selectedModelId).replace(/^ollama\//, "")}
                     </strong>
                   </span>
-                  <span>·</span>
-                  <span>
-                    Duration:{" "}
-                    <strong className="text-zinc-200">{formatDuration(generationResult.duration_ms)}</strong>
-                  </span>
+                  {generationResult?.duration_ms != null && (
+                    <>
+                      <span>·</span>
+                      <span>
+                        Duration:{" "}
+                        <strong className="text-zinc-200">{formatDuration(generationResult.duration_ms)}</strong>
+                      </span>
+                    </>
+                  )}
+                  {generationStatus === "cancelled" && (
+                    <>
+                      <span>·</span>
+                      <span className="text-amber-400/90 italic">Stopped by user</span>
+                    </>
+                  )}
                 </div>
 
-                {generationResult.usage && (
+                {generationResult?.usage && (
                   <div className="text-[10px] text-zinc-500">
                     {generationResult.usage.prompt_tokens != null && (
                       <span>Prompt: {generationResult.usage.prompt_tokens} tokens </span>

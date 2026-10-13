@@ -1,10 +1,42 @@
 # mlue Development Progress
 
-## Current Milestone: Brick 2A — Provider-Independent Inference & Ollama Test Playground
+## Current Milestone: Brick 2B — Real-Time Inference Streaming & Cancellation
 
 ---
 
-### Milestone: Brick 2A — Provider-Independent Inference & Ollama Test Playground (Current)
+### Milestone: Brick 2B — Real-Time Inference Streaming & Cancellation (Completed)
+
+#### 1. Implemented in Brick 2B
+- **Canonical Streaming Event Contract**: Defined `InferenceEvent` enum (`Started`, `Delta`, `Completed`, `Cancelled`, `Error`) with tagged JSON serialization in `src-tauri/src/inference/types.rs`.
+- **Streaming Model Inference Trait**: Extended `ModelInference` trait in `src-tauri/src/inference/mod.rs` with `stream(&self, request)` returning `InferenceEventStream` (`Pin<Box<dyn Stream<Item = Result<InferenceEvent, InferenceError>> + Send>>`) alongside non-streaming `generate()`.
+- **Ollama Native Streaming Driver**: Implemented `stream_with_upstream` in `src-tauri/src/providers/ollama.rs` calling `POST /api/chat` with `"stream": true`.
+- **Incremental NDJSON Parser**: Robust byte-stream parser that handles multiple NDJSON objects per chunk, split NDJSON across chunks, UTF-8 code points split across chunk boundaries (via `\n` boundary slicing), blank line skipping, bounded buffering (64 KiB line limit), premature EOF detection, and extraction of `prompt_eval_count`, `eval_count`, and `done_reason`. User text is extracted strictly from `message.content` without mixing in reasoning fields.
+- **Tauri 2 IPC Channels**: Implemented `start_test_stream` command using `tauri::ipc::Channel<InferenceEvent>`. Channels deliver events directly to the requesting window without global event bus clutter. Requests are registered before acknowledging start to prevent cancellation races.
+- **Active Inference & Cancellation Manager**: Built `InferenceManager` in `src-tauri/src/inference/manager.rs` managing active requests with `tokio_util::sync::CancellationToken` and `TerminalGuard` (atomic CAS guaranteeing exactly one terminal event: `Completed`, `Cancelled`, or `Error`). Dropping the upstream Reqwest response stream on cancellation immediately aborts the underlying HTTP socket connection.
+- **Concurrency Control & Semaphore**: Integrated concurrency management using `tokio::sync::Semaphore` (max 2 concurrent Ollama tasks) with RAII permit reclamation across normal completion, cancellation, errors, and timeouts.
+- **Decoupled Streaming Timeout Policy**: Replaced short timeouts with decoupled streaming policies: 5s connection, 30s initial response, 15s idle stream, and 300s overall generation timeout.
+- **Tightened Input Boundaries**: Validated max 50 chat messages, 64 KiB single message, 128 KiB total bytes before provider network calls.
+- **React Desktop Playground**: Enhanced `src/App.tsx` with streaming mode, real-time incremental rendering with 20ms throttled UI batching, Stop Generation button, instant cancellation status transition, clear badges (`Streaming...`, `Generation stopped`, `Completed`, `Inference error`), and component unmount cancellation cleanup.
+- **Automated Mock-Server Test Suite**: Implemented 20 dedicated integration tests in `tests/streaming_tests.rs` covering all 20 required scenarios from Section 14 (multi-delta, single-chunk NDJSON, split NDJSON across chunks, split UTF-8 character, token accumulation, completion finish reason, usage extraction, malformed JSON, HTTP error before stream, network disconnect mid-stream, premature EOF without `done: true`, cancellation before first token, cancellation after multiple tokens, upstream HTTP connection drop verification, single terminal event guarantee via `TerminalGuard`, permit release on cancellation, simultaneous request isolation, concurrent non-blocking registry reads, request limit violations, and non-streaming regression tests).
+
+#### 2. Validation & Testing
+- `cargo fmt --check`: Clean (0 diffs).
+- `cargo check`: Passed.
+- `cargo test`: **55 passed, 0 failed** across `streaming_tests.rs` (22), `inference_tests.rs` (17), `ollama_discovery_tests.rs` (10), and `server_tests.rs` (6).
+- `cargo clippy --all-targets -- -D warnings`: 0 warnings across all targets.
+- `npm run build`: Production bundle built cleanly (TypeScript `tsc` + Vite).
+- `npm run tauri build -- --debug`: Successfully packaged macOS native application (`mlue.app`, 43.32 MiB) and installer bundle (`mlue_0.1.0_aarch64.dmg`, 10.20 MiB).
+
+#### 3. Known Blockers
+- None.
+
+#### 4. Outstanding Work (Next Milestones)
+- **Brick 3**: API Key Generation, SQLite Credential Persistence & Public API Authentication.
+- **Brick 4**: OpenAI-Compatible Reverse Proxy API (`/v1/chat/completions` & `/v1/models`).
+
+---
+
+### Milestone: Brick 2A — Provider-Independent Inference & Ollama Test Playground (Completed)
 
 #### 1. Implemented in Brick 2A
 - **Provider-Independent Inference Contracts**: Defined canonical `InferenceRequest`, `ChatMessage`, `MessageRole`, `UsageInfo`, and `InferenceResponse` in `src-tauri/src/inference/types.rs`.

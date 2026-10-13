@@ -1,18 +1,21 @@
 pub mod types;
 
 use crate::inference::InferenceError;
-use crate::inference::types::{InferenceRequest, InferenceResponse};
+use crate::inference::types::{InferenceEvent, InferenceRequest, InferenceResponse};
 use crate::providers::ollama::OllamaProvider;
 use crate::providers::{DiscoveryError, ModelDiscovery};
 use chrono::Utc;
+use futures_util::Stream;
+use std::pin::Pin;
 use std::sync::RwLock;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 pub use types::{DiscoveredModelsResponse, ModelCapabilities, ModelInfo, ProviderStatus};
 
-pub const MAX_MESSAGES_COUNT: usize = 100;
-pub const MAX_SINGLE_MESSAGE_CHARS: usize = 500_000;
-pub const MAX_TOTAL_CONTENT_CHARS: usize = 1_000_000;
+pub const MAX_MESSAGES_COUNT: usize = 50;
+pub const MAX_SINGLE_MESSAGE_BYTES: usize = 64 * 1024; // 64 KiB
+pub const MAX_TOTAL_CONTENT_BYTES: usize = 128 * 1024; // 128 KiB
 
 pub struct ModelRegistry {
     snapshot: RwLock<DiscoveredModelsResponse>,
@@ -95,12 +98,10 @@ impl ModelRegistry {
         lock.clone()
     }
 
-    pub async fn execute_inference(
+    pub fn validate_request_boundaries(
         &self,
-        provider: &OllamaProvider,
-        request: InferenceRequest,
-    ) -> Result<InferenceResponse, InferenceError> {
-        // Step 0: Request security & resource validation
+        request: &InferenceRequest,
+    ) -> Result<(), InferenceError> {
         if request.messages.is_empty() {
             return Err(InferenceError::InvalidRequest(
                 "Messages list cannot be empty".to_string(),
@@ -108,26 +109,38 @@ impl ModelRegistry {
         }
         if request.messages.len() > MAX_MESSAGES_COUNT {
             return Err(InferenceError::InvalidRequest(format!(
-                "Too many messages (maximum is {})",
-                MAX_MESSAGES_COUNT
+                "Too many messages: maximum is {} (received {})",
+                MAX_MESSAGES_COUNT,
+                request.messages.len()
             )));
         }
-        let mut total_chars = 0;
+        let mut total_bytes = 0;
         for msg in &request.messages {
-            if msg.content.len() > MAX_SINGLE_MESSAGE_CHARS {
-                return Err(InferenceError::InvalidRequest(
-                    "A single message exceeds the maximum allowed length (500,000 characters)"
-                        .to_string(),
-                ));
+            let msg_bytes = msg.content.len();
+            if msg_bytes > MAX_SINGLE_MESSAGE_BYTES {
+                return Err(InferenceError::InvalidRequest(format!(
+                    "A single message exceeds the maximum allowed size of 64 KiB ({} bytes)",
+                    msg_bytes
+                )));
             }
-            total_chars += msg.content.len();
-            if total_chars > MAX_TOTAL_CONTENT_CHARS {
-                return Err(InferenceError::InvalidRequest(
-                    "Total prompt content exceeds the maximum allowed length (1,000,000 characters)"
-                        .to_string(),
-                ));
+            total_bytes += msg_bytes;
+            if total_bytes > MAX_TOTAL_CONTENT_BYTES {
+                return Err(InferenceError::InvalidRequest(format!(
+                    "Total prompt content exceeds the maximum allowed size of 128 KiB ({} bytes)",
+                    total_bytes
+                )));
             }
         }
+        Ok(())
+    }
+
+    pub async fn execute_inference(
+        &self,
+        provider: &OllamaProvider,
+        request: InferenceRequest,
+    ) -> Result<InferenceResponse, InferenceError> {
+        // Step 0: Request security & resource validation
+        self.validate_request_boundaries(&request)?;
 
         // Step 1 & 2: Validate model exists in registry and provider status
         // NOTE: Registry lock is acquired briefly and released immediately before network I/O
@@ -193,5 +206,85 @@ impl ModelRegistry {
 
         // Step 5 & 6: Execute provider request without holding any registry lock
         provider.generate_with_upstream(&upstream_id, request).await
+    }
+
+    pub async fn execute_inference_stream(
+        &self,
+        provider: &OllamaProvider,
+        request: InferenceRequest,
+        cancellation_token: CancellationToken,
+    ) -> Result<
+        Pin<Box<dyn Stream<Item = Result<InferenceEvent, InferenceError>> + Send>>,
+        InferenceError,
+    > {
+        // Step 0: Request security & resource validation
+        self.validate_request_boundaries(&request)?;
+
+        // Step 1 & 2: Validate model exists in registry and provider status
+        // NOTE: Registry lock is acquired briefly and released immediately before network I/O
+        let (upstream_id, provider_status) = {
+            let snapshot = self.snapshot.read().unwrap_or_else(|p| p.into_inner());
+            let found_model = snapshot
+                .models
+                .iter()
+                .find(|m| m.id == request.model_id)
+                .cloned();
+            (found_model.map(|m| m.upstream_id), snapshot.status)
+        };
+
+        let upstream_id = match upstream_id {
+            Some(id) => id,
+            None => {
+                return Err(InferenceError::ModelNotFound(format!(
+                    "Model '{}' is not registered or installed",
+                    request.model_id
+                )));
+            }
+        };
+
+        if provider_status == ProviderStatus::Unreachable {
+            return Err(InferenceError::ProviderUnreachable(
+                "Ollama is currently unreachable".to_string(),
+            ));
+        }
+
+        // Step 3 & 4: Validate text-completion capability via /api/show (cached)
+        let capabilities = match provider.get_or_inspect_capabilities(&upstream_id).await {
+            Ok(caps) => caps,
+            Err(DiscoveryError::Unreachable(msg)) => {
+                return Err(InferenceError::ProviderUnreachable(msg));
+            }
+            Err(DiscoveryError::HttpStatus { code, message }) => {
+                if code == 404 {
+                    return Err(InferenceError::ModelNotFound(format!(
+                        "Model '{}' was not found by Ollama",
+                        upstream_id
+                    )));
+                }
+                return Err(InferenceError::HttpStatus { code, message });
+            }
+            Err(err) => return Err(InferenceError::Other(err.to_string())),
+        };
+
+        match capabilities.chat {
+            Some(true) => {}
+            Some(false) => {
+                return Err(InferenceError::UnsupportedCapability(format!(
+                    "Model '{}' does not support text chat/completion (it may be an embedding-only model)",
+                    upstream_id
+                )));
+            }
+            None => {
+                return Err(InferenceError::UnsupportedCapability(format!(
+                    "Model '{}' capabilities could not be verified to support text completion",
+                    upstream_id
+                )));
+            }
+        }
+
+        // Step 5 & 6: Execute provider stream without holding any registry lock
+        provider
+            .stream_with_upstream(&upstream_id, request, cancellation_token)
+            .await
     }
 }

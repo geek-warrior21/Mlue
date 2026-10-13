@@ -83,6 +83,7 @@ async fn test_case_1_successful_single_turn_chat() {
     assert_eq!(snapshot.status, ProviderStatus::Ready);
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -149,6 +150,7 @@ async fn test_case_2_successful_multi_turn_chat() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![
             ChatMessage {
@@ -219,6 +221,7 @@ async fn test_case_3_system_message_forwarded_correctly() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![
             ChatMessage {
@@ -282,6 +285,7 @@ async fn test_case_4_exact_upstream_model_identifier_used() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/llama3.2:1b-instruct-q4_K_M".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -335,6 +339,7 @@ async fn test_case_5_correct_normalization_of_response_content() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/test:1b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -388,6 +393,7 @@ async fn test_case_6_usage_metadata_parsed_when_present() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/test:1b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -429,6 +435,7 @@ async fn test_case_7_unavailable_model_rejected() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/ghost-model:latest".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -491,6 +498,7 @@ async fn test_case_8_embedding_only_model_rejected_after_capability_inspection()
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/nomic-embed-text".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -549,6 +557,7 @@ async fn test_case_9_provider_http_error_handled() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -608,6 +617,7 @@ async fn test_case_10_malformed_json_handled() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -671,6 +681,7 @@ async fn test_case_11_provider_timeout_handled() {
     registry.refresh(&provider).await;
 
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -735,6 +746,7 @@ async fn test_case_12_model_capability_cache_works_and_invalidates_correctly() {
     registry.refresh(&provider).await;
 
     let make_req = || InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -805,6 +817,7 @@ async fn test_case_13_concurrent_inference_does_not_block_registry_reads() {
     // Spawn long-running inference in background
     let inference_handle = tokio::spawn(async move {
         let request = InferenceRequest {
+            request_id: None,
             model_id: "ollama/qwen3:8b".to_string(),
             messages: vec![ChatMessage {
                 role: MessageRole::User,
@@ -858,6 +871,7 @@ async fn test_case_14_direct_model_inference_trait() {
 
     let provider = OllamaProvider::new(&endpoint);
     let request = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![ChatMessage {
             role: MessageRole::User,
@@ -983,6 +997,7 @@ async fn test_case_17_request_limits_validation() {
 
     // 1. Empty messages rejected
     let empty_req = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: vec![],
     };
@@ -995,14 +1010,15 @@ async fn test_case_17_request_limits_validation() {
         other => panic!("Expected InvalidRequest, got {:?}", other),
     }
 
-    // 2. Too many messages rejected (> 100)
-    let too_many_messages: Vec<ChatMessage> = (0..101)
+    // 2. Too many messages rejected (> 50)
+    let too_many_messages: Vec<ChatMessage> = (0..51)
         .map(|i| ChatMessage {
             role: MessageRole::User,
             content: format!("msg {}", i),
         })
         .collect();
     let excessive_req = InferenceRequest {
+        request_id: None,
         model_id: "ollama/qwen3:8b".to_string(),
         messages: too_many_messages,
     };
@@ -1012,6 +1028,56 @@ async fn test_case_17_request_limits_validation() {
         .unwrap_err();
     match err_excessive {
         InferenceError::InvalidRequest(msg) => assert!(msg.contains("Too many messages")),
+        other => panic!("Expected InvalidRequest, got {:?}", other),
+    }
+
+    // 3. Single message content > 64 KiB rejected
+    let big_single_req = InferenceRequest {
+        request_id: None,
+        model_id: "ollama/qwen3:8b".to_string(),
+        messages: vec![ChatMessage {
+            role: MessageRole::User,
+            content: "x".repeat(65 * 1024),
+        }],
+    };
+    let err_single = registry
+        .execute_inference(&provider, big_single_req)
+        .await
+        .unwrap_err();
+    match err_single {
+        InferenceError::InvalidRequest(msg) => {
+            assert!(msg.contains("64 KiB") && msg.contains("exceeds"));
+        }
+        other => panic!("Expected InvalidRequest, got {:?}", other),
+    }
+
+    // 4. Combined message content > 128 KiB rejected
+    let big_total_req = InferenceRequest {
+        request_id: None,
+        model_id: "ollama/qwen3:8b".to_string(),
+        messages: vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: "x".repeat(60 * 1024),
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: "y".repeat(60 * 1024),
+            },
+            ChatMessage {
+                role: MessageRole::User,
+                content: "z".repeat(10 * 1024),
+            },
+        ],
+    };
+    let err_total = registry
+        .execute_inference(&provider, big_total_req)
+        .await
+        .unwrap_err();
+    match err_total {
+        InferenceError::InvalidRequest(msg) => {
+            assert!(msg.contains("128 KiB") && msg.contains("exceeds"));
+        }
         other => panic!("Expected InvalidRequest, got {:?}", other),
     }
 }

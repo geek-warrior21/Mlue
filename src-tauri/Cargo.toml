@@ -22,8 +22,11 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 http-body-util = "0.1"
 thiserror = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+bytes = "1"
 
 [profile.release]
 codegen-units = 1
