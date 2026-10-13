@@ -1,8 +1,11 @@
 pub mod api;
+pub mod inference;
 pub mod providers;
 pub mod registry;
 pub mod runtime;
 
+use inference::InferenceErrorPayload;
+use inference::types::{InferenceRequest, InferenceResponse};
 use providers::ollama::{DEFAULT_OLLAMA_ENDPOINT, OllamaProvider};
 use registry::{DiscoveredModelsResponse, ModelRegistry};
 use runtime::server::{DEFAULT_HOST, DEFAULT_PORT, default_endpoint, run_server};
@@ -26,7 +29,20 @@ async fn refresh_ollama(
     registry: State<'_, Arc<ModelRegistry>>,
     provider: State<'_, Arc<OllamaProvider>>,
 ) -> Result<DiscoveredModelsResponse, String> {
-    Ok(registry.refresh(&*provider).await)
+    provider.clear_capabilities_cache();
+    Ok(registry.refresh(provider.inner()).await)
+}
+
+#[tauri::command]
+async fn generate_test_completion(
+    registry: State<'_, Arc<ModelRegistry>>,
+    provider: State<'_, Arc<OllamaProvider>>,
+    request: InferenceRequest,
+) -> Result<InferenceResponse, InferenceErrorPayload> {
+    registry
+        .execute_inference(provider.inner().as_ref(), request)
+        .await
+        .map_err(InferenceErrorPayload::from)
 }
 
 pub struct ServerShutdownHandle {
@@ -57,7 +73,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_runtime_status,
             get_discovered_models,
-            refresh_ollama
+            refresh_ollama,
+            generate_test_completion
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -70,6 +87,7 @@ pub fn run() {
             // 2. Spawn initial asynchronous Ollama model discovery and emit event
             tauri::async_runtime::spawn(async move {
                 use tauri::Emitter;
+                provider_for_init.clear_capabilities_cache();
                 let snapshot = registry_for_init.refresh(&*provider_for_init).await;
                 let _ = app_handle.emit("models-updated", &snapshot);
             });

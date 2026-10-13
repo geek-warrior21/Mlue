@@ -46,12 +46,37 @@ export interface DiscoveredModelsResponse {
   error: string | null;
 }
 
+export interface UsageInfo {
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+}
+
+export interface InferenceResult {
+  model_id: string;
+  content: string;
+  finish_reason?: string | null;
+  usage?: UsageInfo | null;
+  duration_ms?: number | null;
+}
+
+export interface InferenceErrorState {
+  code: string;
+  message: string;
+  technical_details?: string | null;
+}
+
 function formatBytes(bytes: number | null): string | null {
   if (bytes == null || bytes === 0) return null;
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+function formatDuration(durationMs?: number | null): string {
+  if (durationMs == null) return "0.0s";
+  return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
 export default function App() {
@@ -67,6 +92,13 @@ export default function App() {
   const [discoveryData, setDiscoveryData] = useState<DiscoveredModelsResponse | null>(null);
   const [discoveryLoading, setDiscoveryLoading] = useState<boolean>(true);
   const [isRefreshingOllama, setIsRefreshingOllama] = useState<boolean>(false);
+
+  // Playground State (Brick 2A)
+  const [selectedModelId, setSelectedModelId] = useState<string>("");
+  const [promptText, setPromptText] = useState<string>("");
+  const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [generationResult, setGenerationResult] = useState<InferenceResult | null>(null);
+  const [generationError, setGenerationError] = useState<InferenceErrorState | null>(null);
 
   // Fetch Runtime Status via IPC
   const fetchStatus = useCallback(async () => {
@@ -188,6 +220,17 @@ export default function App() {
     };
   }, [fetchStatus, fetchDiscoveredModels]);
 
+  // Sync selected model with available models
+  useEffect(() => {
+    if (discoveryData && discoveryData.models.length > 0) {
+      if (!selectedModelId || !discoveryData.models.some((m) => m.id === selectedModelId)) {
+        setSelectedModelId(discoveryData.models[0].id);
+      }
+    } else if (discoveryData && discoveryData.models.length === 0) {
+      setSelectedModelId("");
+    }
+  }, [discoveryData, selectedModelId]);
+
   // Terminal state auto-transition: If still checking, poll every 500ms until reaching terminal state
   useEffect(() => {
     if (discoveryData?.status !== "checking") return;
@@ -210,6 +253,59 @@ export default function App() {
     navigator.clipboard.writeText(text);
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
+  };
+
+  // Execute inference in AI Playground
+  const handleGenerate = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (isGenerating || !selectedModelId || !promptText.trim()) return;
+
+    const targetModelId = selectedModelId;
+    const userPrompt = promptText.trim();
+
+    setIsGenerating(true);
+    setGenerationError(null);
+
+    try {
+      if (isTauri()) {
+        const response = await invoke<InferenceResult>("generate_test_completion", {
+          request: {
+            model_id: targetModelId,
+            messages: [
+              {
+                role: "user",
+                content: userPrompt,
+              },
+            ],
+          },
+        });
+        setGenerationResult(response);
+      } else {
+        setGenerationError({
+          code: "TAURI_UNAVAILABLE",
+          message: "Desktop inference requires running inside the Tauri native app.",
+          technical_details: "Web preview mode cannot invoke native IPC.",
+        });
+      }
+    } catch (err: unknown) {
+      console.error("Inference failed:", err);
+      if (err && typeof err === "object" && "message" in err) {
+        const payload = err as { code?: string; message?: string; technical_details?: string };
+        setGenerationError({
+          code: payload.code || "INFERENCE_ERROR",
+          message: payload.message || "Failed to generate completion.",
+          technical_details: payload.technical_details || null,
+        });
+      } else {
+        setGenerationError({
+          code: "UNKNOWN_ERROR",
+          message: typeof err === "string" ? err : "Inference failed unexpectedly.",
+          technical_details: null,
+        });
+      }
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   const endpoint = runtimeStatus?.endpoint || "http://127.0.0.1:4782";
@@ -247,12 +343,13 @@ export default function App() {
 
   const badge = getStatusBadge();
   const providerStatus = discoveryData?.status || "checking";
+  const hasAvailableModels = Boolean(discoveryData?.models && discoveryData.models.length > 0);
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans flex flex-col items-center justify-center p-6 selection:bg-indigo-500/30 selection:text-indigo-200">
-      <div className="w-full max-w-xl bg-zinc-900/80 border border-zinc-800 rounded-2xl p-8 shadow-2xl backdrop-blur-xl transition-all">
+      <div className="w-full max-w-2xl bg-zinc-900/80 border border-zinc-800 rounded-2xl p-8 shadow-2xl backdrop-blur-xl transition-all space-y-6">
         {/* Header */}
-        <header className="flex items-center justify-between border-b border-zinc-800/80 pb-6 mb-6">
+        <header className="flex items-center justify-between border-b border-zinc-800/80 pb-6">
           <div>
             <div className="flex items-center gap-3">
               <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-600/20 border border-indigo-500/30 text-indigo-400 font-bold text-lg">
@@ -276,7 +373,7 @@ export default function App() {
         {runtimeStatus?.error && (
           <div
             id="runtime-error-alert"
-            className="mb-6 p-4 rounded-xl bg-rose-950/40 border border-rose-800/50 text-rose-200 text-sm flex flex-col gap-1"
+            className="p-4 rounded-xl bg-rose-950/40 border border-rose-800/50 text-rose-200 text-sm flex flex-col gap-1"
           >
             <div className="font-semibold flex items-center gap-2 text-rose-300">
               <svg className="w-4 h-4 text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -289,7 +386,7 @@ export default function App() {
         )}
 
         {/* SECTION 1: Embedded Runtime & Local API */}
-        <div className="space-y-3 mb-6">
+        <div className="space-y-3">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
               Embedded Runtime
@@ -304,68 +401,253 @@ export default function App() {
             </button>
           </div>
 
-          {/* Local API Endpoint */}
-          <div className="p-3.5 rounded-xl bg-zinc-950/60 border border-zinc-800/80">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-zinc-400 font-medium">Local API</span>
-              <button
-                id="copy-endpoint-btn"
-                onClick={() => copyToClipboard(endpoint, "endpoint")}
-                className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer"
-              >
-                {copiedKey === "endpoint" ? <span className="text-emerald-400">Copied</span> : "Copy"}
-              </button>
-            </div>
-            <div id="local-api-endpoint" className="font-mono text-xs text-indigo-300 select-all break-all">
-              {endpoint}
-            </div>
-          </div>
-
-          {/* Health Endpoint */}
-          <div className="p-3.5 rounded-xl bg-zinc-950/60 border border-zinc-800/80">
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs text-zinc-400 font-medium">Health</span>
-              <div className="flex items-center gap-2">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            {/* Local API Endpoint */}
+            <div className="p-3.5 rounded-xl bg-zinc-950/60 border border-zinc-800/80">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-zinc-400 font-medium">Local API</span>
                 <button
-                  id="test-health-btn"
-                  onClick={() => testHealth(endpoint)}
-                  disabled={healthLoading}
-                  className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer disabled:opacity-50"
-                >
-                  {healthLoading ? "Pinging..." : "Test"}
-                </button>
-                <span className="text-zinc-600">·</span>
-                <button
-                  id="copy-health-btn"
-                  onClick={() => copyToClipboard(healthUrl, "health")}
+                  id="copy-endpoint-btn"
+                  onClick={() => copyToClipboard(endpoint, "endpoint")}
                   className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer"
                 >
-                  {copiedKey === "health" ? <span className="text-emerald-400">Copied</span> : "Copy"}
+                  {copiedKey === "endpoint" ? <span className="text-emerald-400">Copied</span> : "Copy"}
                 </button>
               </div>
-            </div>
-            <div id="health-endpoint" className="font-mono text-xs text-indigo-300 select-all break-all">
-              {healthUrl}
+              <div id="local-api-endpoint" className="font-mono text-xs text-indigo-300 select-all break-all">
+                {endpoint}
+              </div>
             </div>
 
-            {healthData && (
-              <div
-                id="health-response-preview"
-                className="mt-2.5 pt-2.5 border-t border-zinc-800/60 text-[11px] font-mono text-emerald-400/90 flex items-center justify-between"
-              >
-                <span>{JSON.stringify(healthData)}</span>
-                <span className="text-zinc-500 text-[10px]">HTTP 200</span>
+            {/* Health Endpoint */}
+            <div className="p-3.5 rounded-xl bg-zinc-950/60 border border-zinc-800/80">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-zinc-400 font-medium">Health</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    id="test-health-btn"
+                    onClick={() => testHealth(endpoint)}
+                    disabled={healthLoading}
+                    className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    {healthLoading ? "Pinging..." : "Test"}
+                  </button>
+                  <span className="text-zinc-600">·</span>
+                  <button
+                    id="copy-health-btn"
+                    onClick={() => copyToClipboard(healthUrl, "health")}
+                    className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer"
+                  >
+                    {copiedKey === "health" ? <span className="text-emerald-400">Copied</span> : "Copy"}
+                  </button>
+                </div>
               </div>
-            )}
+              <div id="health-endpoint" className="font-mono text-xs text-indigo-300 select-all break-all">
+                {healthUrl}
+              </div>
+
+              {healthData && (
+                <div
+                  id="health-response-preview"
+                  className="mt-2 pt-2 border-t border-zinc-800/60 text-[11px] font-mono text-emerald-400/90 flex items-center justify-between"
+                >
+                  <span className="truncate">{JSON.stringify(healthData)}</span>
+                  <span className="text-zinc-500 text-[10px] ml-1">200 OK</span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
-        {/* SECTION 2: Local AI & Models (Brick 1) */}
+        {/* SECTION 2: AI Playground (Brick 2A) */}
+        <section aria-labelledby="playground-heading" className="border-t border-zinc-800/80 pt-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <h2 id="playground-heading" className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                AI Playground
+              </h2>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+                Test Inference
+              </span>
+            </div>
+            {isGenerating && (
+              <span className="inline-flex items-center gap-1.5 text-xs text-indigo-400 animate-pulse font-medium">
+                <span className="w-2 h-2 rounded-full bg-indigo-400" />
+                Generating response...
+              </span>
+            )}
+          </div>
+
+          <form onSubmit={handleGenerate} className="space-y-4">
+            {/* Model Selector */}
+            <div>
+              <label htmlFor="model-selector" className="block text-xs font-medium text-zinc-300 mb-1.5">
+                Model:
+              </label>
+              <div className="relative">
+                <select
+                  id="model-selector"
+                  value={selectedModelId}
+                  onChange={(e) => setSelectedModelId(e.target.value)}
+                  disabled={!hasAvailableModels || isGenerating}
+                  className="w-full bg-zinc-950/80 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed appearance-none cursor-pointer font-mono"
+                >
+                  {hasAvailableModels ? (
+                    discoveryData?.models.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.display_name} ({model.provider_id})
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">No models available — connect Ollama</option>
+                  )}
+                </select>
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-3.5 text-zinc-500">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                  </svg>
+                </div>
+              </div>
+            </div>
+
+            {/* Prompt Input */}
+            <div>
+              <label htmlFor="prompt-input" className="block text-xs font-medium text-zinc-300 mb-1.5">
+                Prompt:
+              </label>
+              <textarea
+                id="prompt-input"
+                rows={3}
+                value={promptText}
+                onChange={(e) => setPromptText(e.target.value)}
+                placeholder={
+                  hasAvailableModels
+                    ? "Explain machine learning in one sentence."
+                    : "Connect Ollama with a downloaded model to enter prompts."
+                }
+                disabled={!hasAvailableModels || isGenerating}
+                className="w-full bg-zinc-950/80 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed resize-none transition-colors"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    handleGenerate();
+                  }
+                }}
+              />
+              <div className="flex items-center justify-between mt-1 text-[11px] text-zinc-500">
+                <span>Press Cmd+Enter or Ctrl+Enter to submit</span>
+                <span>{promptText.length} characters</span>
+              </div>
+            </div>
+
+            {/* Generate Action Button */}
+            <div className="flex items-center justify-end gap-3">
+              <button
+                type="submit"
+                id="generate-response-btn"
+                disabled={!hasAvailableModels || isGenerating || !promptText.trim()}
+                className="inline-flex items-center gap-2 px-5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 disabled:bg-zinc-800 disabled:text-zinc-500 text-white text-xs font-semibold transition-all cursor-pointer disabled:cursor-not-allowed shadow-md shadow-indigo-900/20"
+              >
+                {isGenerating ? (
+                  <>
+                    <svg className="w-3.5 h-3.5 animate-spin text-white" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    <span>Generating Response...</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                    <span>Generate Response</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </form>
+
+          {/* Playground Error Display */}
+          {generationError && (
+            <div
+              id="playground-error-display"
+              className="mt-4 p-4 rounded-xl bg-rose-950/40 border border-rose-800/50 text-rose-200 text-xs flex flex-col gap-1 transition-all"
+            >
+              <div className="font-semibold flex items-center gap-2 text-rose-300">
+                <svg className="w-4 h-4 text-rose-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span>{generationError.message}</span>
+              </div>
+              {generationError.technical_details && (
+                <p className="text-[11px] text-rose-300/70 font-mono mt-0.5 break-words">
+                  {generationError.technical_details}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Playground Response Display */}
+          {generationResult && (
+            <div
+              id="playground-response-display"
+              className="mt-4 p-4 rounded-xl bg-zinc-950/90 border border-zinc-800/90 transition-all space-y-3"
+            >
+              <div className="flex items-center justify-between border-b border-zinc-800/80 pb-2.5">
+                <span className="text-xs font-semibold text-zinc-300">Response:</span>
+                <button
+                  id="copy-response-btn"
+                  onClick={() => copyToClipboard(generationResult.content, "response")}
+                  className="text-xs text-zinc-400 hover:text-indigo-400 transition-colors cursor-pointer"
+                >
+                  {copiedKey === "response" ? <span className="text-emerald-400">Copied</span> : "Copy"}
+                </button>
+              </div>
+
+              <div
+                id="playground-response-content"
+                className="text-xs leading-relaxed text-zinc-200 whitespace-pre-wrap font-sans"
+              >
+                {generationResult.content}
+              </div>
+
+              <div className="pt-2 border-t border-zinc-800/60 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-zinc-400">
+                <div className="flex items-center gap-3">
+                  <span>
+                    Model:{" "}
+                    <strong className="text-indigo-300 font-semibold">
+                      {generationResult.model_id.replace(/^ollama\//, "")}
+                    </strong>
+                  </span>
+                  <span>·</span>
+                  <span>
+                    Duration:{" "}
+                    <strong className="text-zinc-200">{formatDuration(generationResult.duration_ms)}</strong>
+                  </span>
+                </div>
+
+                {generationResult.usage && (
+                  <div className="text-[10px] text-zinc-500">
+                    {generationResult.usage.prompt_tokens != null && (
+                      <span>Prompt: {generationResult.usage.prompt_tokens} tokens </span>
+                    )}
+                    {generationResult.usage.completion_tokens != null && (
+                      <span>· Eval: {generationResult.usage.completion_tokens} tokens</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* SECTION 3: Local AI & Models (Brick 1) */}
         <div className="border-t border-zinc-800/80 pt-6">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                Local AI Models
+                Discovered Models
               </h2>
               {providerStatus === "ready" && (
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
@@ -396,39 +678,39 @@ export default function App() {
           {providerStatus === "checking" && (
             <div
               id="ollama-status-checking"
-              className="p-5 rounded-xl bg-zinc-950/60 border border-zinc-800/80 flex items-center gap-3.5"
+              className="p-4 rounded-xl bg-zinc-950/60 border border-zinc-800/80 flex items-center gap-3.5"
             >
               <div className="w-4 h-4 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin flex-shrink-0" />
               <div>
-                <p className="text-sm font-medium text-zinc-200">Looking for local AI models...</p>
-                <p className="text-xs text-zinc-400 mt-0.5">Connecting to Ollama at http://127.0.0.1:11434</p>
+                <p className="text-xs font-medium text-zinc-200">Looking for local AI models...</p>
+                <p className="text-[11px] text-zinc-400 mt-0.5">Connecting to Ollama at http://127.0.0.1:11434</p>
               </div>
             </div>
           )}
 
           {providerStatus === "ready" && discoveryData && (
-            <div id="ollama-status-ready" className="space-y-3">
-              <div className="flex items-center gap-2 px-1">
+            <div id="ollama-status-ready" className="space-y-2">
+              <div className="flex items-center gap-2 px-1 mb-1">
                 <span className="w-2 h-2 rounded-full bg-emerald-400" />
                 <span className="text-xs font-medium text-emerald-400">Ollama connected</span>
               </div>
 
-              <div id="discovered-models-list" className="space-y-2">
+              <div id="discovered-models-list" className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
                 {discoveryData.models.map((model) => (
                   <div
                     key={model.id}
-                    className="p-3.5 rounded-xl bg-zinc-950/60 border border-zinc-800/80 hover:border-zinc-700/80 transition-colors flex items-center justify-between"
+                    className="p-3 rounded-xl bg-zinc-950/60 border border-zinc-800/80 hover:border-zinc-700/80 transition-colors flex items-center justify-between"
                   >
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-semibold text-zinc-100 font-mono">
+                        <span className="text-xs font-semibold text-zinc-100 font-mono">
                           {model.display_name}
                         </span>
-                        <span className="px-1.5 py-0.5 rounded text-[10px] uppercase font-mono font-bold bg-zinc-800 text-zinc-400">
+                        <span className="px-1.5 py-0.5 rounded text-[9px] uppercase font-mono font-bold bg-zinc-800 text-zinc-400">
                           {model.provider_id}
                         </span>
                       </div>
-                      <div className="text-[11px] text-zinc-400 mt-1 flex items-center gap-2">
+                      <div className="text-[10px] text-zinc-400 mt-0.5 flex items-center gap-2">
                         {model.parameter_size && <span>Parameters: {model.parameter_size}</span>}
                         {model.quantization_level && (
                           <>
@@ -446,8 +728,8 @@ export default function App() {
                     </div>
 
                     <div className="text-right">
-                      <span className="inline-block px-2 py-0.5 rounded text-[11px] font-medium bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
-                        Ready
+                      <span className="inline-block px-2 py-0.5 rounded text-[10px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                        Available
                       </span>
                     </div>
                   </div>
@@ -459,14 +741,14 @@ export default function App() {
           {providerStatus === "no_models" && (
             <div
               id="ollama-status-no-models"
-              className="p-5 rounded-xl bg-zinc-950/60 border border-amber-900/40 text-amber-200/90"
+              className="p-4 rounded-xl bg-zinc-950/60 border border-amber-900/40 text-amber-200/90"
             >
-              <div className="flex items-center gap-2 font-medium text-sm text-amber-300">
+              <div className="flex items-center gap-2 font-medium text-xs text-amber-300">
                 <span className="w-2 h-2 rounded-full bg-amber-400" />
                 <span>Ollama is running, but no models were found.</span>
               </div>
-              <p className="text-xs text-zinc-400 mt-2">
-                Download a model in your terminal using: <code className="text-indigo-300 font-mono bg-zinc-900 px-1.5 py-0.5 rounded">ollama pull llama3.2</code>, then click Refresh.
+              <p className="text-[11px] text-zinc-400 mt-1.5">
+                Download a model in your terminal using: <code className="text-indigo-300 font-mono bg-zinc-900 px-1 py-0.5 rounded">ollama pull llama3.2</code>, then click Refresh Models.
               </p>
             </div>
           )}
@@ -474,13 +756,13 @@ export default function App() {
           {providerStatus === "unreachable" && (
             <div
               id="ollama-status-unreachable"
-              className="p-5 rounded-xl bg-zinc-950/60 border border-zinc-800/80"
+              className="p-4 rounded-xl bg-zinc-950/60 border border-zinc-800/80"
             >
-              <div className="flex items-center gap-2 font-medium text-sm text-zinc-300">
+              <div className="flex items-center gap-2 font-medium text-xs text-zinc-300">
                 <span className="w-2 h-2 rounded-full bg-zinc-500" />
                 <span>Ollama couldn't be reached.</span>
               </div>
-              <p className="text-xs text-zinc-400 mt-1.5 leading-relaxed">
+              <p className="text-[11px] text-zinc-400 mt-1 leading-relaxed">
                 Ollama does not appear to be running on port 11434. If Ollama is installed, launch it in the background and click <strong className="text-zinc-300">Refresh Models</strong>.
               </p>
             </div>
@@ -489,13 +771,13 @@ export default function App() {
           {providerStatus === "error" && (
             <div
               id="ollama-status-error"
-              className="p-5 rounded-xl bg-rose-950/30 border border-rose-900/40 text-rose-200"
+              className="p-4 rounded-xl bg-rose-950/30 border border-rose-900/40 text-rose-200"
             >
-              <div className="flex items-center gap-2 font-medium text-sm text-rose-300">
+              <div className="flex items-center gap-2 font-medium text-xs text-rose-300">
                 <span className="w-2 h-2 rounded-full bg-rose-400" />
                 <span>Ollama discovery encountered an issue</span>
               </div>
-              <p className="text-xs text-rose-300/80 mt-1.5">
+              <p className="text-[11px] text-rose-300/80 mt-1">
                 {discoveryData?.error || "An error occurred while communicating with Ollama."}
               </p>
             </div>
@@ -503,7 +785,7 @@ export default function App() {
         </div>
 
         {/* Footer info */}
-        <footer className="mt-6 pt-4 border-t border-zinc-800/60 flex items-center justify-between text-[11px] text-zinc-500 font-mono">
+        <footer className="pt-4 border-t border-zinc-800/60 flex items-center justify-between text-[11px] text-zinc-500 font-mono">
           <span>mlue v0.1.0</span>
           <span>{lastRefreshed ? `Checked ${lastRefreshed.toLocaleTimeString()}` : ""}</span>
         </footer>

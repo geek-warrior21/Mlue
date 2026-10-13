@@ -25,6 +25,15 @@ mlue is a local-first desktop application that allows users to expose supported 
   - `refresh_ollama`: User-triggered asynchronous discovery refresh with connection serialization.
 - **Desktop UI Local Models Section**: Interactive visual status indicating `checking`, `ready` (with model cards), `no_models`, `unreachable`, or `error` with manual Refresh action.
 
+### Brick 2A — Provider-Independent Inference & Ollama Test Playground
+- **Provider-Independent Inference Abstraction**: Canonical `InferenceRequest`, `ChatMessage`, `MessageRole`, `UsageInfo`, and `InferenceResponse` types.
+- **`ModelInference` Trait**: Extensible async execution interface implemented for the Ollama adapter.
+- **Ollama Chat Execution**: Native `POST /api/chat` integration supporting text-only single-turn and multi-turn conversations, system prompts, and token usage metrics.
+- **Capability Validation & Caching**: Pre-flight inspection via `POST /api/show` to verify chat capability and reject embedding-only models before execution, with snapshot-synchronized caching.
+- **Desktop Tauri IPC Command**: `generate_test_completion` returning normalized results and duration without holding registry locks.
+- **Desktop AI Playground**: Interactive UI in the desktop app with live model selection, prompt input, generation loading indicator, duration metrics, and structured error display.
+- **Security Boundaries**: Strictly local execution; no unauthenticated public inference HTTP endpoints are exposed.
+
 ---
 
 ## Prerequisites
@@ -33,6 +42,7 @@ mlue is a local-first desktop application that allows users to expose supported 
 - **npm**: v9+ (tested on v11+)
 - **Rust**: 1.80+ (tested on 1.99 stable)
 - **C Compiler / Platform SDK**: Xcode Command Line Tools on macOS (`xcode-select --install`)
+- **Ollama** (optional for live model testing): Locally installed and running on `http://127.0.0.1:11434`
 
 ---
 
@@ -82,25 +92,23 @@ Expected response (`HTTP/1.1 200 OK`):
 }
 ```
 
-You can also test the endpoint directly from the desktop UI using the **Test** action next to the Health endpoint.
-
 ---
 
 ## What is NOT Implemented Yet (Planned for Future Bricks)
 
-The following capabilities are deliberately out of scope for Brick 0 and Brick 1:
+The following capabilities are deliberately out of scope for Brick 2A:
 
-- `/v1/chat/completions` or `/v1/models` public reverse proxy
-- Model execution or prompt generation
-- API key generation and management
+- Streaming generation and Server-Sent Events (SSE) (deferred to Brick 2B)
+- Public `/v1/chat/completions` or `/v1/models` HTTP endpoints (Brick 4)
+- API key generation and management (Brick 3)
+- SQLite database integration (Brick 3)
 - Cloud provider connections (OpenAI, Gemini, Anthropic)
-- SQLite database integration
 - Public networking / remote tunnels (Tailscale)
-- Model downloading/pulling workflows
-- System tray integration
+- Automatic model downloading or pulling workflows
+- Agentic shell execution
 
 ---
 
 ## Architecture & Guidelines
 
-For details on the embedded runtime lifecycle and discovery registry, refer to [ARCHITECTURE.md](docs/ARCHITECTURE.md). For progress history, see [PROGRESS.md](docs/PROGRESS.md). For engineering invariants, see [AGENTS.md](AGENTS.md).
+For details on the embedded runtime lifecycle, discovery registry, and inference architecture, refer to [ARCHITECTURE.md](docs/ARCHITECTURE.md). For progress history, see [PROGRESS.md](docs/PROGRESS.md). For engineering invariants, see [AGENTS.md](AGENTS.md).
