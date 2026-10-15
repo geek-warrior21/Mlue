@@ -387,4 +387,121 @@ All inference requests are validated before acquiring concurrency permits or mak
 ### 6.8 Known Limitations (Brick 2B)
 - Public HTTP inference (`/v1/chat/completions`) remains disabled; inference is strictly accessible via internal desktop Tauri IPC.
 - Model downloading/pulling workflows are out of scope.
-- Multi-user credentials and API keys are scheduled for Brick 3.
+
+---
+
+## 7. Project Management, SQLite Persistence & Secure API Keys (Brick 3A)
+
+### 7.1 Project Ownership Hierarchy
+
+`mlue` organizes model consumption into distinct administrative **Projects**. A Project represents a distinct application, agent, or integration that consumes local AI capabilities through dedicated API credentials:
+
+```text
+mlue Desktop Installation
+    │
+    ├── Project A (e.g. "My Study Bot")
+    │      ├── API Key 1 (mlue_sk_..., policy: local_only)
+    │      └── API Key 2 (mlue_sk_..., policy: selected_models)
+    │
+    └── Project B (e.g. "Website AI Backend")
+           └── API Key 3 (mlue_sk_..., policy: local_only)
+```
+
+#### Future Extension Hierarchy
+The architecture intentionally keeps projects separate from future user-level abstractions:
+```text
+Project
+   ├── API Keys
+   ├── End Users   [future milestone]
+   ├── Sessions    [future milestone]
+   └── Memories    [future milestone]
+```
+
+### 7.2 Database Location & Storage Engine
+
+- **Persistence Layer**: Embedded SQLite powered by `sqlx` (v0.8) with connection pooling (`SqlitePool`).
+- **OS-Standard Path**: Database files are stored exclusively in the operating system's canonical application data directory obtained via Tauri 2's `app.path().app_data_dir()` API (e.g., `~/Library/Application Support/app.mlue.desktop/mlue.db` on macOS). Persistent files are never placed relative to the process working directory or temporary folders.
+- **Journal & Performance Configuration**:
+  - `PRAGMA journal_mode = WAL` (Write-Ahead Logging for high concurrency without blocking reads).
+  - `PRAGMA synchronous = NORMAL`.
+  - `PRAGMA foreign_keys = ON` (strict relational integrity enforcement).
+  - `PRAGMA busy_timeout = 5000` (5-second lock queueing).
+
+### 7.3 Schema & Versioned Migration Engine
+
+Schema management uses a migration runner that tracks applied migrations in `_schema_migrations`. Migrations are executed within database transactions during application initialization before any IPC handlers or HTTP servers accept traffic:
+
+#### Schema Tables
+
+1. **`projects`**:
+   - `id`: TEXT PRIMARY KEY (stable UUID v4)
+   - `name`: TEXT NOT NULL (1 to 100 characters)
+   - `description`: TEXT NULL (up to 500 characters)
+   - `created_at`: TEXT NOT NULL (ISO 8601 UTC)
+   - `updated_at`: TEXT NOT NULL (ISO 8601 UTC)
+
+2. **`api_keys`**:
+   - `id`: TEXT PRIMARY KEY (stable UUID v4)
+   - `project_id`: TEXT NOT NULL (Foreign Key referencing `projects(id)` ON DELETE CASCADE)
+   - `name`: TEXT NOT NULL (1 to 100 characters)
+   - `key_prefix`: TEXT NOT NULL (first 16 characters for safe identification, e.g. `mlue_sk_a1b2c3d4...`)
+   - `key_hash`: TEXT NOT NULL UNIQUE (SHA-256 digest in hex)
+   - `access_policy`: TEXT NOT NULL (JSON-serialized `AccessPolicy`)
+   - `enabled`: BOOLEAN NOT NULL DEFAULT 1
+   - `created_at`: TEXT NOT NULL (ISO 8601 UTC)
+   - `last_used_at`: TEXT NULL (ISO 8601 UTC)
+   - `revoked_at`: TEXT NULL (ISO 8601 UTC)
+
+3. **`settings`**:
+   - `key`: TEXT PRIMARY KEY
+   - `value`: TEXT NOT NULL
+
+4. **Indexes**:
+   - `idx_api_keys_project_id` on `api_keys(project_id)`
+   - `idx_api_keys_key_hash` on `api_keys(key_hash)`
+
+### 7.4 Cryptographic API-Key Generation & Secret Hygiene
+
+- **Secret Format**: `mlue_sk_<random_secret>`
+- **Entropy**: Generated using operating system cryptographically secure random number generator (`rand::rngs::OsRng`), producing 32 random bytes (256 bits of entropy).
+- **Encoding**: URL-safe base64 without padding (`URL_SAFE_NO_PAD`).
+- **One-Time Plaintext Secret Exposure**:
+  - The plaintext secret exists in memory only during creation and is returned once in `CreatedApiKey.full_key`.
+  - Plaintext keys are **never stored** in SQLite, configuration files, or logs.
+  - The desktop UI immediately presents a copy modal with the explicit notice: *"Copy this key now. For security, mlue won't show it again."*
+  - The UI clears the one-time secret state immediately upon dismissal.
+- **Cryptographic Digest**: SQLite stores only the hex-encoded SHA-256 digest (`key_hash`).
+- **Constant-Time Verification**: Key authentication hashes candidate keys and compares against stored digests using `subtle::ConstantTimeEq` to prevent timing side-channel attacks.
+- **Metadata Protection**: `ApiKeyMetadata` strictly exposes `key_prefix` (e.g., `mlue_sk_8f7b3a1...`) and omits the hash or any secret material.
+
+### 7.5 Access Policies & Permission Enforcement
+
+Every API key is bound to an `AccessPolicy`:
+1. `local_only` (Default):
+   - Restricts key usage to local models (e.g. `ollama/*`, `local/*`).
+   - Strictly denies any external or remote provider model identifiers (e.g. `openai/*`, `anthropic/*`, `gemini/*`, `cloud/*`).
+   - The alias `auto` resolves to permitted local models.
+2. `selected_models`:
+   - Restricts key usage to an explicit whitelist of registered model IDs (e.g. `["ollama/qwen3:8b", "ollama/llama3:8b"]`).
+   - Keys cannot invoke unlisted models even if hosted locally.
+
+### 7.6 Service Layer Separation
+
+- **`ProjectService`**: Handles project CRUD, input validation, and cascade deletion. Does not depend on Axum or Tauri UI types.
+- **`ApiKeyService`**: Handles CSPRNG key generation, SHA-256 digest calculation, key verification, last-used updates, key revocation, and policy evaluation. Does not depend on Tauri UI components.
+- **Storage Layer**: Manages SQLite connection pool lifecycle, migration runners, and transaction safety.
+- **Tauri IPC Command Layer**: Thin adapters exposing:
+  - `create_project`
+  - `list_projects`
+  - `update_project`
+  - `delete_project`
+  - `create_api_key`
+  - `list_api_keys`
+  - `revoke_api_key`
+
+### 7.7 Security Boundaries & Non-Goals
+
+- **Administrative Control Plane**: All project and key management commands run strictly over internal Tauri IPC. Zero administrative or management endpoints are exposed over Axum HTTP.
+- **No HTTP `/admin` Endpoint**: The desktop application is the sole administrative surface.
+- **No Public Inference in Brick 3A**: Public HTTP `/v1/chat/completions` and `/v1/models` with API-key authentication middleware are reserved for Brick 3B and Brick 4.
+

@@ -82,6 +82,35 @@ export type InferenceEventType =
 
 export type GenerationStatus = "idle" | "generating" | "completed" | "cancelled" | "error";
 
+export interface Project {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type AccessPolicy =
+  | { type: "local_only" }
+  | { type: "selected_models"; models: string[] };
+
+export interface ApiKeyMetadata {
+  id: string;
+  project_id: string;
+  name: string;
+  key_prefix: string;
+  access_policy: AccessPolicy;
+  enabled: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+export interface CreatedApiKey {
+  metadata: ApiKeyMetadata;
+  full_key: string;
+}
+
 function formatBytes(bytes: number | null): string | null {
   if (bytes == null || bytes === 0) return null;
   const k = 1024;
@@ -119,6 +148,35 @@ export default function App() {
   const [generationResult, setGenerationResult] = useState<InferenceResult | null>(null);
   const [generationError, setGenerationError] = useState<InferenceErrorState | null>(null);
   const [isStreamingMode, setIsStreamingMode] = useState<boolean>(true);
+
+  // Projects & API Keys State (Brick 3A)
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [apiKeys, setApiKeys] = useState<ApiKeyMetadata[]>([]);
+  const [projectsLoading, setProjectsLoading] = useState<boolean>(true);
+  const [keysLoading, setKeysLoading] = useState<boolean>(false);
+  const [projectError, setProjectError] = useState<string | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
+
+  // Project Modals
+  const [showNewProjectModal, setShowNewProjectModal] = useState<boolean>(false);
+  const [newProjectName, setNewProjectName] = useState<string>("");
+  const [newProjectDesc, setNewProjectDesc] = useState<string>("");
+
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const [editProjectName, setEditProjectName] = useState<string>("");
+  const [editProjectDesc, setEditProjectDesc] = useState<string>("");
+  const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
+
+  // API Key Modals & One-Time Display
+  const [showNewKeyModal, setShowNewKeyModal] = useState<boolean>(false);
+  const [newKeyName, setNewKeyName] = useState<string>("");
+  const [newKeyPolicyType, setNewKeyPolicyType] = useState<"local_only" | "selected_models">("local_only");
+  const [selectedPolicyModels, setSelectedPolicyModels] = useState<string[]>([]);
+  const [createdKeyData, setCreatedKeyData] = useState<CreatedApiKey | null>(null);
+  const [revokingKeyId, setRevokingKeyId] = useState<string | null>(null);
+
+  const selectedProject = projects.find((p) => p.id === selectedProjectId) || null;
 
   const activeRequestIdRef = useRef<string | null>(null);
   const contentBufferRef = useRef<string>("");
@@ -266,12 +324,228 @@ export default function App() {
     return () => clearInterval(interval);
   }, [discoveryData?.status, fetchDiscoveredModels]);
 
-  // When runtime is running, verify health
-  useEffect(() => {
-    if (runtimeStatus?.state === "running") {
-      testHealth(runtimeStatus.endpoint);
+  // Fetch Projects via IPC
+  const fetchProjects = useCallback(async () => {
+    setProjectsLoading(true);
+    setProjectError(null);
+    try {
+      if (isTauri()) {
+        const list = await invoke<Project[]>("list_projects");
+        setProjects(list);
+        setSelectedProjectId((prev) => {
+          if (prev && list.some((p) => p.id === prev)) return prev;
+          return list.length > 0 ? list[0].id : null;
+        });
+      } else {
+        const mock: Project[] = [
+          {
+            id: "proj_default_1",
+            name: "My Study Bot",
+            description: "Study assistant integration",
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          },
+        ];
+        setProjects(mock);
+        setSelectedProjectId("proj_default_1");
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setProjectError(`Failed to load projects: ${msg}`);
+    } finally {
+      setProjectsLoading(false);
     }
-  }, [runtimeStatus?.state, runtimeStatus?.endpoint, testHealth]);
+  }, []);
+
+  // Fetch API Keys for selected project
+  const fetchKeys = useCallback(async (projectId: string) => {
+    setKeysLoading(true);
+    setKeyError(null);
+    try {
+      if (isTauri()) {
+        const list = await invoke<ApiKeyMetadata[]>("list_api_keys", {
+          project_id: projectId,
+        });
+        setApiKeys(list);
+      } else {
+        setApiKeys([]);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setKeyError(`Failed to load API keys: ${msg}`);
+    } finally {
+      setKeysLoading(false);
+    }
+  }, []);
+
+  // Trigger project loading on mount
+  useEffect(() => {
+    fetchProjects();
+  }, [fetchProjects]);
+
+  // Sync keys whenever selected project changes
+  useEffect(() => {
+    if (selectedProjectId) {
+      fetchKeys(selectedProjectId);
+    } else {
+      setApiKeys([]);
+    }
+  }, [selectedProjectId, fetchKeys]);
+
+  const handleCreateProject = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newProjectName.trim()) return;
+    try {
+      if (isTauri()) {
+        const created = await invoke<Project>("create_project", {
+          name: newProjectName.trim(),
+          description: newProjectDesc.trim() || null,
+        });
+        setProjects((prev) => [created, ...prev]);
+        setSelectedProjectId(created.id);
+      } else {
+        const mock: Project = {
+          id: `proj_${Date.now()}`,
+          name: newProjectName.trim(),
+          description: newProjectDesc.trim() || null,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        setProjects((prev) => [mock, ...prev]);
+        setSelectedProjectId(mock.id);
+      }
+      setNewProjectName("");
+      setNewProjectDesc("");
+      setShowNewProjectModal(false);
+      setProjectError(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setProjectError(msg);
+    }
+  };
+
+  const handleUpdateProject = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingProject || !editProjectName.trim()) return;
+    try {
+      if (isTauri()) {
+        const updated = await invoke<Project>("update_project", {
+          id: editingProject.id,
+          name: editProjectName.trim(),
+          description: editProjectDesc.trim() || null,
+        });
+        setProjects((prev) =>
+          prev.map((p) => (p.id === updated.id ? updated : p))
+        );
+      } else {
+        setProjects((prev) =>
+          prev.map((p) =>
+            p.id === editingProject.id
+              ? {
+                  ...p,
+                  name: editProjectName.trim(),
+                  description: editProjectDesc.trim() || null,
+                  updated_at: new Date().toISOString(),
+                }
+              : p
+          )
+        );
+      }
+      setEditingProject(null);
+      setProjectError(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setProjectError(msg);
+    }
+  };
+
+  const handleDeleteProject = async (id: string) => {
+    try {
+      if (isTauri()) {
+        await invoke<boolean>("delete_project", { id });
+      }
+      setProjects((prev) => prev.filter((p) => p.id !== id));
+      if (selectedProjectId === id) {
+        const remaining = projects.filter((p) => p.id !== id);
+        setSelectedProjectId(remaining.length > 0 ? remaining[0].id : null);
+      }
+      setDeletingProjectId(null);
+      setProjectError(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setProjectError(msg);
+    }
+  };
+
+  const handleCreateKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedProjectId || !newKeyName.trim()) return;
+    try {
+      const policy: AccessPolicy =
+        newKeyPolicyType === "local_only"
+          ? { type: "local_only" }
+          : { type: "selected_models", models: selectedPolicyModels };
+
+      if (isTauri()) {
+        const result = await invoke<CreatedApiKey>("create_api_key", {
+          project_id: selectedProjectId,
+          name: newKeyName.trim(),
+          access_policy: policy,
+        });
+        setApiKeys((prev) => [result.metadata, ...prev]);
+        setCreatedKeyData(result);
+      } else {
+        const mockCreated: CreatedApiKey = {
+          metadata: {
+            id: `key_${Date.now()}`,
+            project_id: selectedProjectId,
+            name: newKeyName.trim(),
+            key_prefix: "mlue_sk_mock1234...",
+            access_policy: policy,
+            enabled: true,
+            created_at: new Date().toISOString(),
+            last_used_at: null,
+            revoked_at: null,
+          },
+          full_key: "mlue_sk_mock_preview_key_not_for_real_use_1234567890",
+        };
+        setApiKeys((prev) => [mockCreated.metadata, ...prev]);
+        setCreatedKeyData(mockCreated);
+      }
+      setNewKeyName("");
+      setNewKeyPolicyType("local_only");
+      setSelectedPolicyModels([]);
+      setShowNewKeyModal(false);
+      setKeyError(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setKeyError(msg);
+    }
+  };
+
+  const handleRevokeKey = async (keyId: string) => {
+    try {
+      if (isTauri()) {
+        await invoke<boolean>("revoke_api_key", { key_id: keyId });
+      }
+      setApiKeys((prev) =>
+        prev.map((k) =>
+          k.id === keyId
+            ? {
+                ...k,
+                enabled: false,
+                revoked_at: new Date().toISOString(),
+              }
+            : k
+        )
+      );
+      setRevokingKeyId(null);
+      setKeyError(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setKeyError(msg);
+    }
+  };
 
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text);
@@ -609,7 +883,479 @@ export default function App() {
           </div>
         </div>
 
-        {/* SECTION 2: AI Playground (Brick 2A) */}
+        {/* SECTION 2: Projects & API Keys (Brick 3A) */}
+        <section aria-labelledby="projects-heading" className="border-t border-zinc-800/80 pt-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <h2 id="projects-heading" className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                Projects & API Keys
+              </h2>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+                {projects.length} {projects.length === 1 ? "Project" : "Projects"}
+              </span>
+            </div>
+            <button
+              id="new-project-btn"
+              onClick={() => {
+                setNewProjectName("");
+                setNewProjectDesc("");
+                setShowNewProjectModal(true);
+              }}
+              className="text-xs text-indigo-400 hover:text-indigo-300 font-medium inline-flex items-center gap-1 cursor-pointer transition-colors"
+            >
+              + New Project
+            </button>
+          </div>
+
+          {/* Project Error Notification */}
+          {projectError && (
+            <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-800/50 text-rose-200 text-xs flex items-center justify-between">
+              <span>{projectError}</span>
+              <button onClick={() => setProjectError(null)} className="text-rose-400 hover:text-white text-xs cursor-pointer">Dismiss</button>
+            </div>
+          )}
+
+          {/* Key Error Notification */}
+          {keyError && (
+            <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-800/50 text-rose-200 text-xs flex items-center justify-between">
+              <span>{keyError}</span>
+              <button onClick={() => setKeyError(null)} className="text-rose-400 hover:text-white text-xs cursor-pointer">Dismiss</button>
+            </div>
+          )}
+
+          {/* One-Time Plaintext Secret Box (Security requirement) */}
+          {createdKeyData && (
+            <div id="new-key-secret-box" className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/40 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  API Key Created: {createdKeyData.metadata.name}
+                </span>
+                <button
+                  id="dismiss-new-key-btn"
+                  onClick={() => setCreatedKeyData(null)}
+                  className="text-xs text-zinc-400 hover:text-white cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+              <div className="p-2.5 rounded-lg bg-amber-950/50 border border-amber-800/50 text-amber-200 text-xs font-medium flex items-center gap-2">
+                <span>⚠️ Copy this key now. For security, mlue won't show it again.</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="new-key-plaintext-input"
+                  type="text"
+                  readOnly
+                  value={createdKeyData.full_key}
+                  className="w-full font-mono text-xs bg-zinc-950 border border-zinc-700/80 rounded-lg px-3 py-2 text-emerald-300 select-all"
+                />
+                <button
+                  id="copy-new-key-btn"
+                  onClick={() => copyToClipboard(createdKeyData.full_key, "new-key-secret")}
+                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap"
+                >
+                  {copiedKey === "new-key-secret" ? "Copied!" : "Copy Key"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Project List / Selector */}
+          {projectsLoading ? (
+            <p className="text-xs text-zinc-500 italic">Loading projects...</p>
+          ) : projects.length === 0 ? (
+            <div className="p-5 rounded-xl bg-zinc-950/60 border border-zinc-800/80 text-center space-y-2">
+              <p className="text-xs text-zinc-400">No projects yet. Create a project to organize your applications and generate API keys.</p>
+              <button
+                onClick={() => setShowNewProjectModal(true)}
+                className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg transition-colors cursor-pointer"
+              >
+                Create First Project
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {/* Project Tabs */}
+              <div id="project-tabs" className="flex items-center gap-2 overflow-x-auto pb-1">
+                {projects.map((proj) => (
+                  <button
+                    key={proj.id}
+                    onClick={() => setSelectedProjectId(proj.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all whitespace-nowrap cursor-pointer flex items-center gap-1.5 ${
+                      selectedProjectId === proj.id
+                        ? "bg-zinc-800 text-white border border-zinc-700 shadow-sm"
+                        : "bg-zinc-950/60 text-zinc-400 hover:text-zinc-200 border border-zinc-800/60"
+                    }`}
+                  >
+                    <span>{proj.name}</span>
+                  </button>
+                ))}
+              </div>
+
+              {/* Selected Project Card */}
+              {selectedProject && (
+                <div id="selected-project-card" className="p-4 rounded-xl bg-zinc-950/60 border border-zinc-800/80 space-y-4">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
+                        {selectedProject.name}
+                      </h3>
+                      {selectedProject.description ? (
+                        <p className="text-xs text-zinc-400 mt-0.5">{selectedProject.description}</p>
+                      ) : (
+                        <p className="text-[11px] text-zinc-500 italic mt-0.5">No description</p>
+                      )}
+                      <p className="text-[10px] text-zinc-500 font-mono mt-1">
+                        ID: {selectedProject.id} · Created {new Date(selectedProject.created_at).toLocaleDateString()}
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        id="edit-project-btn"
+                        onClick={() => {
+                          setEditingProject(selectedProject);
+                          setEditProjectName(selectedProject.name);
+                          setEditProjectDesc(selectedProject.description || "");
+                        }}
+                        className="text-xs text-zinc-400 hover:text-zinc-200 px-2.5 py-1 rounded-lg border border-zinc-800 hover:border-zinc-700 cursor-pointer transition-colors"
+                      >
+                        Rename
+                      </button>
+                      <button
+                        id="delete-project-btn"
+                        onClick={() => setDeletingProjectId(selectedProject.id)}
+                        className="text-xs text-rose-400 hover:text-rose-300 px-2.5 py-1 rounded-lg border border-rose-950 hover:border-rose-900 cursor-pointer transition-colors"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* API Keys List */}
+                  <div className="pt-3 border-t border-zinc-800/80 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-zinc-300">API Keys</span>
+                        <span className="text-[10px] text-zinc-500 font-mono">({apiKeys.length})</span>
+                      </div>
+                      <button
+                        id="generate-key-btn"
+                        onClick={() => {
+                          setNewKeyName("");
+                          setNewKeyPolicyType("local_only");
+                          setSelectedPolicyModels([]);
+                          setShowNewKeyModal(true);
+                        }}
+                        className="px-2.5 py-1 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 rounded-lg text-xs font-medium cursor-pointer transition-colors"
+                      >
+                        + Generate Key
+                      </button>
+                    </div>
+
+                    {keysLoading ? (
+                      <p className="text-xs text-zinc-500 italic">Loading API keys...</p>
+                    ) : apiKeys.length === 0 ? (
+                      <p className="text-xs text-zinc-500 italic">No API keys generated yet for this project.</p>
+                    ) : (
+                      <div id="api-keys-list" className="space-y-2">
+                        {apiKeys.map((key) => {
+                          const isActive = key.enabled && !key.revoked_at;
+                          return (
+                            <div
+                              key={key.id}
+                              className="p-3 rounded-lg bg-zinc-900/60 border border-zinc-800 flex items-center justify-between text-xs"
+                            >
+                              <div className="space-y-0.5">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-medium text-zinc-200">{key.name}</span>
+                                  <span
+                                    className={`px-1.5 py-0.2 rounded text-[10px] font-semibold border ${
+                                      isActive
+                                        ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                        : "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                                    }`}
+                                  >
+                                    {isActive ? "Active" : "Revoked"}
+                                  </span>
+                                  <span className="text-[10px] font-mono text-zinc-500 bg-zinc-950 px-1.5 py-0.5 rounded">
+                                    {key.access_policy.type === "local_only" ? "local_only" : "selected_models"}
+                                  </span>
+                                </div>
+                                <div className="font-mono text-[11px] text-zinc-400">
+                                  Prefix: <span className="text-indigo-300">{key.key_prefix}</span>
+                                </div>
+                                <div className="text-[10px] text-zinc-500">
+                                  Created: {new Date(key.created_at).toLocaleDateString()}
+                                  {key.last_used_at && ` · Last used: ${new Date(key.last_used_at).toLocaleTimeString()}`}
+                                </div>
+                              </div>
+
+                              <div>
+                                {isActive && (
+                                  <button
+                                    id={`revoke-key-${key.id}`}
+                                    onClick={() => setRevokingKeyId(key.id)}
+                                    className="text-xs text-rose-400/80 hover:text-rose-300 px-2.5 py-1 rounded-lg border border-rose-950 hover:border-rose-900 cursor-pointer transition-colors"
+                                  >
+                                    Revoke
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Modal: Create Project */}
+          {showNewProjectModal && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
+                <h3 className="text-sm font-bold text-white">Create New Project</h3>
+                <form onSubmit={handleCreateProject} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">Project Name *</label>
+                    <input
+                      id="new-project-name-input"
+                      type="text"
+                      required
+                      maxLength={100}
+                      placeholder="e.g. My Study Bot"
+                      value={newProjectName}
+                      onChange={(e) => setNewProjectName(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">Description (Optional)</label>
+                    <textarea
+                      id="new-project-desc-input"
+                      maxLength={500}
+                      placeholder="Integration details or notes..."
+                      value={newProjectDesc}
+                      onChange={(e) => setNewProjectDesc(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-indigo-500 resize-none h-20"
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowNewProjectModal(false)}
+                      className="px-3 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-white cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      id="create-project-submit-btn"
+                      type="submit"
+                      disabled={!newProjectName.trim()}
+                      className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                    >
+                      Create Project
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* Modal: Edit Project */}
+          {editingProject && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
+                <h3 className="text-sm font-bold text-white">Rename Project</h3>
+                <form onSubmit={handleUpdateProject} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">Project Name *</label>
+                    <input
+                      id="edit-project-name-input"
+                      type="text"
+                      required
+                      maxLength={100}
+                      value={editProjectName}
+                      onChange={(e) => setEditProjectName(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">Description (Optional)</label>
+                    <textarea
+                      id="edit-project-desc-input"
+                      maxLength={500}
+                      value={editProjectDesc}
+                      onChange={(e) => setEditProjectDesc(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-indigo-500 resize-none h-20"
+                    />
+                  </div>
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setEditingProject(null)}
+                      className="px-3 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-white cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      id="save-project-btn"
+                      type="submit"
+                      disabled={!editProjectName.trim()}
+                      className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                    >
+                      Save Changes
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* Modal: Delete Project Confirmation */}
+          {deletingProjectId && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
+                <h3 className="text-sm font-bold text-rose-300">Delete Project?</h3>
+                <p className="text-xs text-zinc-300 leading-relaxed">
+                  Are you sure you want to delete this project? All associated API keys will also be permanently revoked and deleted. This action cannot be undone.
+                </p>
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setDeletingProjectId(null)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-white cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    id="confirm-delete-project-btn"
+                    onClick={() => handleDeleteProject(deletingProjectId)}
+                    className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                  >
+                    Confirm Delete
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Modal: Create API Key */}
+          {showNewKeyModal && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
+                <h3 className="text-sm font-bold text-white">Generate Secure API Key</h3>
+                <form onSubmit={handleCreateKey} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">Key Name *</label>
+                    <input
+                      id="new-key-name-input"
+                      type="text"
+                      required
+                      maxLength={100}
+                      placeholder="e.g. Next.js Web App"
+                      value={newKeyName}
+                      onChange={(e) => setNewKeyName(e.target.value)}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-300 mb-1">Access Policy</label>
+                    <select
+                      id="new-key-policy-select"
+                      value={newKeyPolicyType}
+                      onChange={(e) => setNewKeyPolicyType(e.target.value as "local_only" | "selected_models")}
+                      className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="local_only">Local Only (Default) — Access all detected local models</option>
+                      <option value="selected_models">Selected Models — Restrict to specific models</option>
+                    </select>
+                  </div>
+
+                  {newKeyPolicyType === "selected_models" && (
+                    <div className="space-y-1.5 max-h-32 overflow-y-auto p-2 rounded-lg bg-zinc-950 border border-zinc-800">
+                      <p className="text-[11px] text-zinc-400 mb-1">Select authorized models:</p>
+                      {discoveryData && discoveryData.models.length > 0 ? (
+                        discoveryData.models.map((m) => (
+                          <label key={m.id} className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={selectedPolicyModels.includes(m.id)}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setSelectedPolicyModels((prev) => [...prev, m.id]);
+                                } else {
+                                  setSelectedPolicyModels((prev) => prev.filter((id) => id !== m.id));
+                                }
+                              }}
+                              className="rounded border-zinc-700 bg-zinc-900"
+                            />
+                            <span>{m.display_name}</span>
+                          </label>
+                        ))
+                      ) : (
+                        <p className="text-xs text-zinc-500 italic">No models currently discovered.</p>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowNewKeyModal(false)}
+                      className="px-3 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-white cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      id="create-key-submit-btn"
+                      type="submit"
+                      disabled={!newKeyName.trim()}
+                      className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                    >
+                      Generate Key
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {/* Modal: Revoke Key Confirmation */}
+          {revokingKeyId && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+              <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full space-y-4 shadow-2xl">
+                <h3 className="text-sm font-bold text-rose-300">Revoke API Key?</h3>
+                <p className="text-xs text-zinc-300 leading-relaxed">
+                  Are you sure you want to revoke this API key? Applications using this credential will immediately be rejected and cannot authenticate. This action cannot be reversed.
+                </p>
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setRevokingKeyId(null)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-white cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    id="confirm-revoke-key-btn"
+                    onClick={() => handleRevokeKey(revokingKeyId)}
+                    className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                  >
+                    Revoke Key
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+
+        {/* SECTION 3: AI Playground (Brick 2A & 2B) */}
         <section aria-labelledby="playground-heading" className="border-t border-zinc-800/80 pt-6">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">

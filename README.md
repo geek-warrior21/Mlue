@@ -43,6 +43,16 @@ mlue is a local-first desktop application that allows users to expose supported 
 - **Decoupled Timeout Policy**: Decoupled connection (5s), initial response (30s), idle token (15s), and overall generation (300s) timeouts.
 - **React Playground Streaming Experience**: Real-time token rendering with throttled UI frame updates, live Stop Generation button, latency metrics, and component unmount cleanup.
 
+### Brick 3A — Project Management, SQLite Persistence & Secure API Keys
+- **Projects Ownership Model**: Hierarchical project entities (`mlue installation -> Project -> API Keys`) cleanly separated from future user/session layers.
+- **Embedded SQLite Storage**: Database powered by `sqlx` (v0.8) with WAL mode, foreign keys, and automatic OS application data directory placement (`app.path().app_data_dir()`).
+- **Versioned Migrations**: Automated schema migration runner executing transaction-safe migrations tracked in `_schema_migrations`.
+- **CSPRNG API Key Generation**: `mlue_sk_<secret>` generated with 256 bits of OS entropy (`rand::rngs::OsRng`) and URL-safe base64 encoding.
+- **Secret Hygiene & Constant-Time Verification**: Plaintext keys are never stored in SQLite and are presented only once upon generation. Stored digests use SHA-256 and are authenticated using `subtle::ConstantTimeEq`. Routine listings return only metadata with non-sensitive prefixes.
+- **Model Access Policy Framework**: Granular permission models (`local_only` default, `selected_models` whitelist) blocking access to non-local providers.
+- **Desktop Administrative Control Plane**: Dedicated Tauri IPC commands for Project CRUD, Key Generation, Key Listing, and Revocation; zero administration endpoints are exposed over public HTTP.
+- **Desktop UI**: Comprehensive Project & Key Management dashboard with creation, editing, deletion, safe key generation modal, and key revocation controls.
+
 ---
 
 ## Prerequisites

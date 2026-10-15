@@ -1,10 +1,67 @@
 # mlue Development Progress
 
-## Current Milestone: Brick 2B — Real-Time Inference Streaming & Cancellation
+## Current Milestone: Brick 3A — Project Management, SQLite Persistence & Secure API Keys
 
 ---
 
-### Milestone: Brick 2B — Real-Time Inference Streaming & Cancellation (Completed)
+### Milestone: Brick 3A — Project Management, SQLite Persistence & Secure API Keys (Completed)
+
+#### 1. Implemented in Brick 3A
+- **Prerequisite Audit & Closure of Brick 2B**: Completed exhaustive audit of 7 critical requirements (cancellable queuing, single terminal event, request cleanup, permit release, closed channel teardown, cross-window isolation, zero unauthenticated endpoints) and committed locally as `2c30036`: `feat: add streaming inference and cancellation`.
+- **Embedded SQLite Storage Layer**: Built persistent SQLite storage using `sqlx` (v0.8) with WAL journal mode, 5-second busy timeout, and automatic database directory resolution in the OS application data path (`app.path().app_data_dir()`, e.g. `~/Library/Application Support/app.mlue.desktop/mlue.db`). Persistent files are never placed relative to the process working directory.
+- **Versioned Schema Migration Engine**: Created migration runner tracking applied migrations in `_schema_migrations` with `PRAGMA foreign_keys = ON` and transaction safety. Migration 1 initializes `projects`, `api_keys`, `settings` tables and performance indexes (`idx_api_keys_project_id`, `idx_api_keys_key_hash`).
+- **Project Management Service (`ProjectService`)**: Transactional CRUD operations for Projects (UUID v4 identifiers, name validation 1-100 characters, optional descriptions up to 500 characters, timestamps, and confirmed cascading deletion of projects and owned keys). Fully decoupled from Axum and Tauri UI layers.
+- **Cryptographic API Key Service (`ApiKeyService`)**:
+  - Secure random key generation using operating system CSPRNG (`rand::rngs::OsRng`) producing 256 bits of entropy.
+  - Canonical key formatting: `mlue_sk_<url_safe_base64_secret>`.
+  - Non-sensitive prefix extraction (`mlue_sk_` + first 8 characters) for safe UI identification.
+  - SHA-256 cryptographic hashing for persistence in SQLite; plaintext secret is NEVER stored in database, configuration, or logs.
+  - Constant-time verification using `subtle::ConstantTimeEq` against timing side-channel attacks.
+  - Key metadata type (`ApiKeyMetadata`) that strictly omits `key_hash` or secret strings from routine listing queries.
+  - One-time plaintext secret carrier (`CreatedApiKey`) returned only upon initial generation.
+  - Key revocation enforcement (`revoked_at` timestamp) preventing revoked keys from authenticating.
+  - Usage tracking (`last_used_at` timestamp) updated on successful verification.
+- **Model Access Policy Enforcement**:
+  - `AccessPolicy` model supporting `local_only` (default) and `selected_models` (explicit whitelist).
+  - Strict enforcement: `local_only` permits local/Ollama models (`ollama/*`, `local/*`) and rejects external provider identifiers (`openai/*`, `anthropic/*`, `gemini/*`, `cloud/*`).
+  - Model alias `auto` resolves to permitted models.
+- **Tauri IPC Administrative Control Plane**:
+  - Exposed desktop-only commands: `create_project`, `list_projects`, `update_project`, `delete_project`, `create_api_key`, `list_api_keys`, `revoke_api_key`.
+  - Zero administrative or CRUD endpoints exposed on the embedded Axum HTTP server; desktop UI is the sole authorized control plane.
+- **Desktop React UI for Projects & Credentials**:
+  - Added dedicated **Projects & API Keys** interface in `src/App.tsx`.
+  - Project list, creation modal, rename modal, and confirmed delete modal.
+  - Key listing table displaying name, prefix (`mlue_sk_...`), policy badge (`Local Models Only`, `Selected Models`), status badge (`Active`, `Revoked`), creation date, and last used date.
+  - Generate Key modal with name input and policy selector.
+  - One-Time Secret Copy Modal with explicit warning: *"Copy this key now. For security, mlue won't show it again."* Plaintext secret is cleared upon dismissal.
+  - Revoke key confirmation modal.
+  - Preserved existing Runtime Status, Ollama Discovery, and Test Playground views.
+- **Automated Test Suite**:
+  - Implemented 18 comprehensive integration tests in `tests/persistence_and_auth_tests.rs` covering all required scenarios: first-run DB init, migration execution, project CRUD, cascade deletion, multi-key per project, cross-project key isolation, formatting validation, correct key auth, incorrect key rejection, revoked key rejection, revocation persistence across DB re-open, absence of plaintext in DB rows, safe listing responses, access policy checks, non-local model rejection, and error recovery/integrity.
+  - 100% of tests run in isolated in-memory or temporary-file SQLite databases.
+
+#### 2. Validation & Testing
+- `cargo fmt --check`: Clean (0 diffs).
+- `cargo check`: Passed.
+- `cargo test`: **73 passed, 0 failed** across:
+  - `persistence_and_auth_tests.rs`: 18 passed
+  - `streaming_tests.rs`: 22 passed
+  - `inference_tests.rs`: 17 passed
+  - `ollama_discovery_tests.rs`: 10 passed
+  - `server_tests.rs`: 6 passed
+- `cargo clippy --all-targets -- -D warnings`: 0 warnings across all targets.
+- `npm run build`: Production bundle built cleanly (TypeScript `tsc` + Vite).
+- `npm run tauri build -- --debug`: Successfully packaged macOS native application (`mlue.app`, 50.72 MiB) and installer bundle (`mlue_0.1.0_aarch64.dmg`, 12.09 MiB).
+- **Live Runtime Verification**: Started desktop binary, verified creation of `mlue.db` (WAL mode, schema version 1 applied) in `~/Library/Application Support/app.mlue.desktop/`, and verified loopback server `/health` returns HTTP 200.
+
+#### 3. Known Blockers
+- None.
+
+#### 4. Outstanding Work (Next Milestones)
+- **Brick 3B**: Public HTTP Authentication Middleware & Route Protection.
+- **Brick 4**: OpenAI-Compatible Reverse Proxy API (`/v1/chat/completions` & `/v1/models`).
+
+---
 
 #### 1. Implemented in Brick 2B
 - **Canonical Streaming Event Contract**: Defined `InferenceEvent` enum (`Started`, `Delta`, `Completed`, `Cancelled`, `Error`) with tagged JSON serialization in `src-tauri/src/inference/types.rs`.

@@ -1,18 +1,25 @@
 pub mod api;
 pub mod inference;
+pub mod keys;
+pub mod projects;
 pub mod providers;
 pub mod registry;
 pub mod runtime;
+pub mod storage;
 
 use inference::types::{ChatMessage, InferenceEvent, InferenceRequest, InferenceResponse};
 use inference::{InferenceError, InferenceErrorPayload, InferenceManager, TerminalGuard};
+use keys::ApiKeyService;
+use keys::types::{AccessPolicy, ApiKeyMetadata, CreatedApiKey};
+use projects::ProjectService;
+use projects::types::Project;
 use providers::ollama::{DEFAULT_OLLAMA_ENDPOINT, OllamaProvider};
 use registry::{DiscoveredModelsResponse, ModelRegistry};
 use runtime::server::{DEFAULT_HOST, DEFAULT_PORT, default_endpoint, run_server};
 use runtime::state::{AppState, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 use tokio::sync::watch;
 
 #[tauri::command]
@@ -32,6 +39,84 @@ async fn refresh_ollama(
 ) -> Result<DiscoveredModelsResponse, String> {
     provider.clear_capabilities_cache();
     Ok(registry.refresh(provider.inner()).await)
+}
+
+// --- Project Management Commands ---
+
+#[tauri::command(rename_all = "snake_case")]
+async fn create_project(
+    projects: State<'_, Arc<ProjectService>>,
+    name: String,
+    description: Option<String>,
+) -> Result<Project, String> {
+    projects
+        .create_project(&name, description.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn list_projects(projects: State<'_, Arc<ProjectService>>) -> Result<Vec<Project>, String> {
+    projects.list_projects().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn update_project(
+    projects: State<'_, Arc<ProjectService>>,
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+) -> Result<Project, String> {
+    let desc_arg = description.map(|d| if d.is_empty() { None } else { Some(d) });
+    projects
+        .update_project(
+            &id,
+            name.as_deref(),
+            desc_arg.as_ref().map(|d| d.as_deref()),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn delete_project(
+    projects: State<'_, Arc<ProjectService>>,
+    id: String,
+) -> Result<bool, String> {
+    projects
+        .delete_project(&id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// --- API Key Management Commands ---
+
+#[tauri::command(rename_all = "snake_case")]
+async fn create_api_key(
+    keys: State<'_, Arc<ApiKeyService>>,
+    project_id: String,
+    name: String,
+    access_policy: Option<AccessPolicy>,
+) -> Result<CreatedApiKey, String> {
+    keys.create_key(&project_id, &name, access_policy)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn list_api_keys(
+    keys: State<'_, Arc<ApiKeyService>>,
+    project_id: String,
+) -> Result<Vec<ApiKeyMetadata>, String> {
+    keys.list_keys(&project_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn revoke_api_key(
+    keys: State<'_, Arc<ApiKeyService>>,
+    key_id: String,
+) -> Result<bool, String> {
+    keys.revoke_key(&key_id).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -244,10 +329,34 @@ pub fn run() {
             refresh_ollama,
             generate_test_completion,
             start_test_stream,
-            cancel_test_completion
+            cancel_test_completion,
+            create_project,
+            list_projects,
+            update_project,
+            delete_project,
+            create_api_key,
+            list_api_keys,
+            revoke_api_key
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();
+
+            // 0. Initialize SQLite database in OS app data directory
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from(".mlue_data"));
+            let db_path = app_data_dir.join("mlue.db");
+            let pool = tauri::async_runtime::block_on(async {
+                storage::init_pool_at_path(&db_path)
+                    .await
+                    .expect("Failed to initialize SQLite database")
+            });
+            let project_service = Arc::new(ProjectService::new(pool.clone()));
+            let api_key_service = Arc::new(ApiKeyService::new(pool));
+
+            app.manage(project_service);
+            app.manage(api_key_service);
 
             // 1. Spawn embedded Axum HTTP server
             tauri::async_runtime::spawn(async move {
