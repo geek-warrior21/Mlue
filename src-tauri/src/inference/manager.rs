@@ -143,6 +143,13 @@ impl InferenceManager {
             .await
     }
 
+    pub fn try_acquire_permit(&self) -> Result<OwnedSemaphorePermit, InferenceError> {
+        self.semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| InferenceError::InvalidRequest("Inference capacity exceeded".to_string()))
+    }
+
     pub fn active_count(&self) -> usize {
         let map = self
             .active_requests

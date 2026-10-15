@@ -499,9 +499,81 @@ Every API key is bound to an `AccessPolicy`:
   - `list_api_keys`
   - `revoke_api_key`
 
-### 7.7 Security Boundaries & Non-Goals
-
+### 7.7 Security Boundaries
 - **Administrative Control Plane**: All project and key management commands run strictly over internal Tauri IPC. Zero administrative or management endpoints are exposed over Axum HTTP.
 - **No HTTP `/admin` Endpoint**: The desktop application is the sole administrative surface.
-- **No Public Inference in Brick 3A**: Public HTTP `/v1/chat/completions` and `/v1/models` with API-key authentication middleware are reserved for Brick 3B and Brick 4.
+
+---
+
+## 8. Authenticated HTTP API Layer & OpenAI Compatibility (Brick 3B-1)
+
+Brick 3B-1 exposes local AI models through an authenticated, OpenAI-compatible HTTP interface running inside the embedded Axum server on `127.0.0.1:4782`.
+
+```
+[ External App / cURL / Python SDK ]
+               │
+               ├──> HTTP POST http://127.0.0.1:4782/v1/chat/completions
+               │    Headers: Authorization: Bearer mlue_sk_<secret>
+               │
+               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Axum Embedded HTTP Server (127.0.0.1:4782)                                  │
+│                                                                             │
+│ 1. `require_api_key` Middleware:                                            │
+│    • Validate `Bearer mlue_sk_...` header format                            │
+│    • Extract secret -> SHA-256 hash -> Constant-time SQLite verification   │
+│    • Verify parent Project exists and is not deleted                        │
+│    • Verify key is not revoked (`revoked_at IS NULL`)                       │
+│    • Spawn debounced `last_used_at` update (max once / 60s)                 │
+│    • Attach `AuthenticatedKey` to request extensions                        │
+│                                                                             │
+│ 2. Custom Extractor `AppJson<T>`:                                           │
+│    • Enforce 256 KiB maximum request body size (HTTP 413)                   │
+│    • Map JSON parse errors to OpenAI error envelope (HTTP 400 invalid_json) │
+│                                                                             │
+│ 3. `chat_completions_handler`:                                              │
+│    • Reject `stream: true` (HTTP 400 unsupported_parameter)                 │
+│    • Validate message boundaries (max 50, 64 KiB single, 128 KiB total)     │
+│    • Validate roles (system, user, assistant only)                          │
+│    • Fail-closed model access policy check via ModelRegistry metadata:      │
+│      - If model == "auto": deterministically resolve first eligible model   │
+│      - If specific model: verify registry presence, provider, and policy    │
+│    • Acquire inference concurrency permit from Semaphore                    │
+│    • Dispatch canonical InferenceRequest to ModelInference adapter          │
+│    • Drop permit upon completion or failure                                 │
+│    • Wrap canonical response into OpenAI `chat.completion` envelope         │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Local Provider Engine (e.g. Ollama @ 127.0.0.1:11434)                       │
+│ • POST /api/chat                                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.1 Authentication Middleware (`require_api_key`)
+- **Header Parsing**: Rejects missing or malformed headers with HTTP 401 `missing_auth_header` or `invalid_auth_header`.
+- **Database Lookup & Timing Resistance**: Computes the SHA-256 digest of the bearer secret and queries `api_keys` joined with `projects`. Verification uses `subtle::ConstantTimeEq`. Keys of deleted projects or revoked keys are rejected immediately with HTTP 401 `invalid_api_key` or `revoked_api_key`.
+- **Debounced Asynchronous Usage Tracking**: Updates `last_used_at` in the SQLite database at most once every 60 seconds per key. The database update is dispatched via `tokio::spawn` in the background and never blocks request latency.
+- **Context Injection**: Successful authentication attaches `AuthenticatedKey` (`id`, `project_id`, `name`, `key_prefix`, `policy`) into Axum request extensions for downstream handlers.
+
+### 8.2 Fail-Closed Model Access Policy Enforcement
+Model authorization never relies on arbitrary client-provided model name strings or substring guessing:
+1. **Registry Verification**: The model must exist in the active `ModelRegistry`.
+2. **Provider Identity**: The model's owning provider must be verified as active and trusted.
+3. **Policy Checking**:
+   - `local_only`: Only permits models belonging to verified local providers (e.g., `ollama`).
+   - `selected_models`: Verifies that the model's exact identifier is present in the key's explicit allowlist.
+4. **Deterministic `auto` Resolution**: Resolves to the first available chat-capable model that satisfies the key's access policy. Returns HTTP 400 `no_models_available` if no permitted model exists.
+
+### 8.3 Concurrency & Resource Protections
+- **Global Concurrency Semaphore**: HTTP inference requests acquire an `OwnedSemaphorePermit` from `InferenceManager`. If max concurrent tasks (2) are running, requests immediately return HTTP 503 `capacity_exceeded` without hanging or leaking permits.
+- **Payload Limits**: Axum enforces a 256 KiB body limit. Payloads exceeding this receive HTTP 413 `request_too_large`.
+- **Message Content Boundaries**: Requests with >50 messages, >64 KiB single message, or >128 KiB total content are rejected before reaching upstream providers.
+
+### 8.4 OpenAI Compatibility
+- **`GET /v1/models`**: Returns `{ "object": "list", "data": [ ... ] }` containing all models permitted for the caller's key.
+- **`POST /v1/chat/completions`**: Accepts OpenAI-formatted requests and returns `{ "id": "chatcmpl_mlue_...", "object": "chat.completion", "choices": [ ... ], "usage": { ... } }`.
+- **Error Envelopes**: All error responses return standard OpenAI `{ "error": { "message", "type", "param", "code" } }` structures with appropriate HTTP status codes.
+
 

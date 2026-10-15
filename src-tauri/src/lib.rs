@@ -15,7 +15,7 @@ use projects::ProjectService;
 use projects::types::Project;
 use providers::ollama::{DEFAULT_OLLAMA_ENDPOINT, OllamaProvider};
 use registry::{DiscoveredModelsResponse, ModelRegistry};
-use runtime::server::{DEFAULT_HOST, DEFAULT_PORT, default_endpoint, run_server};
+use runtime::server::{DEFAULT_HOST, DEFAULT_PORT, default_endpoint, run_server_with_context};
 use runtime::state::{AppState, RuntimeStatus};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -312,9 +312,12 @@ pub fn run() {
     let state_for_tauri = app_state.clone();
     let registry_for_tauri = model_registry.clone();
     let registry_for_init = model_registry.clone();
+    let registry_for_server = model_registry.clone();
     let provider_for_tauri = ollama_provider.clone();
     let provider_for_init = ollama_provider.clone();
+    let provider_for_server = ollama_provider.clone();
     let manager_for_tauri = inference_manager.clone();
+    let manager_for_server = inference_manager.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
 
     let builder = tauri::Builder::default()
@@ -356,11 +359,26 @@ pub fn run() {
             let api_key_service = Arc::new(ApiKeyService::new(pool));
 
             app.manage(project_service);
-            app.manage(api_key_service);
+            app.manage(api_key_service.clone());
 
-            // 1. Spawn embedded Axum HTTP server
+            let server_context = runtime::server::ServerContext {
+                app_state: state_for_server.clone(),
+                model_registry: registry_for_server,
+                ollama_provider: provider_for_server,
+                inference_manager: manager_for_server,
+                api_key_service,
+            };
+
+            // 1. Spawn embedded Axum HTTP server with full API context
             tauri::async_runtime::spawn(async move {
-                let _ = run_server(DEFAULT_HOST, DEFAULT_PORT, state_for_server, shutdown_rx).await;
+                let _ = run_server_with_context(
+                    DEFAULT_HOST,
+                    DEFAULT_PORT,
+                    state_for_server,
+                    Some(server_context),
+                    shutdown_rx,
+                )
+                .await;
             });
 
             // 2. Spawn initial asynchronous Ollama model discovery and emit event

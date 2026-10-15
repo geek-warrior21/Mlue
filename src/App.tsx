@@ -939,24 +939,87 @@ export default function App() {
                   Dismiss
                 </button>
               </div>
+
               <div className="p-2.5 rounded-lg bg-amber-950/50 border border-amber-800/50 text-amber-200 text-xs font-medium flex items-center gap-2">
                 <span>⚠️ Copy this key now. For security, mlue won't show it again.</span>
               </div>
-              <div className="flex items-center gap-2">
-                <input
-                  id="new-key-plaintext-input"
-                  type="text"
-                  readOnly
-                  value={createdKeyData.full_key}
-                  className="w-full font-mono text-xs bg-zinc-950 border border-zinc-700/80 rounded-lg px-3 py-2 text-emerald-300 select-all"
-                />
+
+              {/* Local API Endpoint */}
+              <div className="space-y-1">
+                <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Local API Endpoint</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="api-endpoint-input"
+                    type="text"
+                    readOnly
+                    value="http://127.0.0.1:4782/v1"
+                    className="w-full font-mono text-xs bg-zinc-950 border border-zinc-700/80 rounded-lg px-3 py-2 text-zinc-300 select-all"
+                  />
+                  <button
+                    id="copy-endpoint-btn"
+                    onClick={() => copyToClipboard("http://127.0.0.1:4782/v1", "api-endpoint")}
+                    className="px-3 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap"
+                  >
+                    {copiedKey === "api-endpoint" ? "Copied!" : "Copy URL"}
+                  </button>
+                </div>
+              </div>
+
+              {/* One-Time Plaintext Key */}
+              <div className="space-y-1">
+                <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">Personal API Key</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="new-key-plaintext-input"
+                    type="text"
+                    readOnly
+                    value={createdKeyData.full_key}
+                    className="w-full font-mono text-xs bg-zinc-950 border border-zinc-700/80 rounded-lg px-3 py-2 text-emerald-300 select-all"
+                  />
+                  <button
+                    id="copy-new-key-btn"
+                    onClick={() => copyToClipboard(createdKeyData.full_key, "new-key-secret")}
+                    className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap"
+                  >
+                    {copiedKey === "new-key-secret" ? "Copied!" : "Copy Key"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Quick Integration / Python Example Button */}
+              <div className="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-t border-emerald-900/40">
+                <span className="text-[11px] text-zinc-400">
+                  mlue must be running locally for requests to succeed.
+                </span>
                 <button
-                  id="copy-new-key-btn"
-                  onClick={() => copyToClipboard(createdKeyData.full_key, "new-key-secret")}
-                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap"
+                  id="copy-python-example-btn"
+                  onClick={() => {
+                    const pythonSnippet = `from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4782/v1",
+    api_key="${createdKeyData.full_key}"
+)
+
+response = client.chat.completions.create(
+    model="auto",
+    messages=[
+        {"role": "user", "content": "Hello from mlue."}
+    ]
+)
+
+print(response.choices[0].message.content)`;
+                    copyToClipboard(pythonSnippet, "python-example");
+                  }}
+                  className="px-3 py-1.5 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap flex items-center gap-1.5"
                 >
-                  {copiedKey === "new-key-secret" ? "Copied!" : "Copy Key"}
+                  <span>🐍</span>
+                  <span>{copiedKey === "python-example" ? "Copied Example!" : "Copy Python Example"}</span>
                 </button>
+              </div>
+
+              <div className="p-2 rounded-lg bg-zinc-900/80 border border-zinc-800 text-[11px] text-zinc-400">
+                <span className="text-zinc-300 font-medium">Notice:</span> HTTP streaming (SSE) and remote network access are not yet available. Send requests with <code className="text-zinc-200 bg-zinc-800 px-1 py-0.5 rounded font-mono">stream: false</code>.
               </div>
             </div>
           )}

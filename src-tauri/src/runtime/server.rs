@@ -1,4 +1,8 @@
 use crate::api::create_router;
+use crate::inference::InferenceManager;
+use crate::keys::ApiKeyService;
+use crate::providers::ollama::OllamaProvider;
+use crate::registry::ModelRegistry;
 use crate::runtime::state::{AppState, RuntimeStatus};
 use axum::http::{HeaderValue, Method};
 use std::net::SocketAddr;
@@ -12,6 +16,15 @@ pub const DEFAULT_PORT: u16 = 4782;
 
 pub fn default_endpoint() -> String {
     format!("http://{}:{}", DEFAULT_HOST, DEFAULT_PORT)
+}
+
+#[derive(Clone)]
+pub struct ServerContext {
+    pub app_state: Arc<AppState>,
+    pub model_registry: Arc<ModelRegistry>,
+    pub ollama_provider: Arc<OllamaProvider>,
+    pub inference_manager: Arc<InferenceManager>,
+    pub api_key_service: Arc<ApiKeyService>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,15 +48,63 @@ pub fn build_app_router() -> axum::Router {
             "tauri://localhost".parse::<HeaderValue>().unwrap(),
             "http://127.0.0.1:1420".parse::<HeaderValue>().unwrap(),
         ])
-        .allow_methods([Method::GET]);
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ]);
 
-    create_router().layer(cors)
+    create_router()
+        .layer(cors)
+        .layer(axum::middleware::from_fn(
+            crate::api::security::validate_host_and_origin,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
+}
+
+pub fn build_app_router_with_context(context: ServerContext) -> axum::Router {
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://localhost:1420".parse::<HeaderValue>().unwrap(),
+            "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
+            "tauri://localhost".parse::<HeaderValue>().unwrap(),
+            "http://127.0.0.1:1420".parse::<HeaderValue>().unwrap(),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ]);
+
+    let api_ctx = crate::api::ApiRouterContext {
+        model_registry: context.model_registry,
+        ollama_provider: context.ollama_provider,
+        inference_manager: context.inference_manager,
+        api_key_service: context.api_key_service,
+    };
+
+    crate::api::create_api_router(api_ctx)
+        .layer(cors)
+        .layer(axum::middleware::from_fn(
+            crate::api::security::validate_host_and_origin,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))
 }
 
 pub async fn run_server(
     host: &str,
     port: u16,
     state: Arc<AppState>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), ServerError> {
+    run_server_with_context(host, port, state, None, shutdown_rx).await
+}
+
+pub async fn run_server_with_context(
+    host: &str,
+    port: u16,
+    state: Arc<AppState>,
+    context: Option<ServerContext>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     let endpoint = format!("http://{}:{}", host, port);
@@ -80,7 +141,10 @@ pub async fn run_server(
     // Server successfully bound port
     state.set_status(RuntimeStatus::running(&endpoint));
 
-    let router = build_app_router();
+    let router = match context {
+        Some(ctx) => build_app_router_with_context(ctx),
+        None => build_app_router(),
+    };
 
     let server_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {

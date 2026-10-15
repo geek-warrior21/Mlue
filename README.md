@@ -53,6 +53,17 @@ mlue is a local-first desktop application that allows users to expose supported 
 - **Desktop Administrative Control Plane**: Dedicated Tauri IPC commands for Project CRUD, Key Generation, Key Listing, and Revocation; zero administration endpoints are exposed over public HTTP.
 - **Desktop UI**: Comprehensive Project & Key Management dashboard with creation, editing, deletion, safe key generation modal, and key revocation controls.
 
+### Brick 3B-1 — Authenticated HTTP Inference & First External API Call
+- **Loopback-Bound OpenAI-Compatible API**: Embedded Axum HTTP endpoints at `http://127.0.0.1:4782/v1`.
+- **Bearer Token Authentication**: Enforces `Authorization: Bearer mlue_sk_<secret>` with SHA-256 verification and cascade deletion checking.
+- **Fail-Closed Model Access Policy**: Validates requests against trusted in-memory model registry metadata and enforces `local_only` or `selected_models` policies.
+- **Deterministic Auto-Routing**: `model: "auto"` routes deterministically to eligible, chat-capable local models.
+- **Endpoints**:
+  - `GET /v1/models`: Returns list of models permitted under the authenticating key.
+  - `POST /v1/chat/completions`: Non-streaming chat completion executing against local providers (e.g. Ollama) and returning canonical OpenAI envelopes.
+- **Resource Limits & Concurrency**: Enforces 256 KiB body limit, 50 message cap, 64 KiB single message cap, 128 KiB total content cap, and global semaphore concurrency control.
+- **Desktop UI Experience**: One-time key generation modal presents endpoint URL, copyable secret, and instant Python SDK copy-paste example.
+
 ---
 
 ## Prerequisites
@@ -93,40 +104,71 @@ npm run tauri dev
 
 ---
 
-## Testing the Health Endpoint
+## Testing Authenticated HTTP Inference
 
-When the application is running, test the embedded HTTP server:
-
+### 1. Test Server Health Check
 ```bash
 curl -i http://127.0.0.1:4782/health
 ```
 
-Expected response (`HTTP/1.1 200 OK`):
+### 2. Generate an API Key
+Launch mlue, open the **Projects & API Keys** tab, select or create a project, and click **Generate Key**. Copy the plaintext secret (`mlue_sk_...`).
 
-```json
-{
-  "status": "ok",
-  "service": "mlue",
-  "version": "0.1.0"
-}
+### 3. List Permitted Models
+```bash
+curl -X GET http://127.0.0.1:4782/v1/models \
+  -H "Authorization: Bearer mlue_sk_YOUR_SECRET"
+```
+
+### 4. Run a Chat Completion via cURL
+```bash
+curl -X POST http://127.0.0.1:4782/v1/chat/completions \
+  -H "Authorization: Bearer mlue_sk_YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [
+      { "role": "user", "content": "Hello mlue! Are you working?" }
+    ]
+  }'
+```
+
+### 5. Run via OpenAI Python SDK
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4782/v1",
+    api_key="mlue_sk_YOUR_SECRET",
+)
+
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "What is 2 + 2?"}],
+    stream=False,
+)
+
+print(response.choices[0].message.content)
 ```
 
 ---
 
 ## What is NOT Implemented Yet (Planned for Future Bricks)
 
-The following capabilities are deliberately out of scope for Brick 2B:
+The following capabilities are deliberately out of scope for Brick 3B-1:
 
-- Public `/v1/chat/completions` or `/v1/models` HTTP endpoints (Brick 4)
-- API key generation and management (Brick 3)
-- SQLite database integration (Brick 3)
+- Server-Sent Events (SSE) HTTP Streaming for `/v1/chat/completions` (`stream: true`)
 - Cloud provider connections (OpenAI, Gemini, Anthropic)
-- Public networking / remote tunnels (Tailscale)
+- Public networking / remote tunnels (Tailscale / wireguard)
 - Automatic model downloading or pulling workflows
 - Agentic shell execution
 
 ---
 
-## Architecture & Guidelines
+## Architecture & API Reference
 
-For details on the embedded runtime lifecycle, discovery registry, and inference architecture, refer to [ARCHITECTURE.md](docs/ARCHITECTURE.md). For progress history, see [PROGRESS.md](docs/PROGRESS.md). For engineering invariants, see [AGENTS.md](AGENTS.md).
+For detailed documentation, refer to:
+- [API Reference](docs/API.md): Endpoints, error codes, and integration patterns.
+- [Architecture](docs/ARCHITECTURE.md): Embedded runtime lifecycle, IPC, and security boundaries.
+- [Progress Log](docs/PROGRESS.md): Chronological brick milestone history.
+- [Engineering Guidelines](AGENTS.md): Architectural invariants and standards.

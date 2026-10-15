@@ -95,6 +95,10 @@ pub enum ApiKeyError {
     InvalidInput(String),
     #[error("Model '{0}' is not authorized by this API key's access policy")]
     UnauthorizedModel(String),
+    #[error("Model '{0}' not found or not registered")]
+    ModelNotFound(String),
+    #[error("No compatible models are available under the current access policy")]
+    NoEligibleModels,
     #[error("Database error: {0}")]
     Database(String),
 }

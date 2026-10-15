@@ -2,6 +2,7 @@ use super::generator::{generate_api_key, hash_api_key, validate_key_format, veri
 use super::types::{
     AccessPolicy, ApiKey, ApiKeyError, ApiKeyMetadata, CreatedApiKey, MAX_KEY_NAME_LENGTH,
 };
+use crate::registry::{ModelInfo, ModelRegistry, ProviderStatus};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -218,6 +219,8 @@ impl ApiKeyService {
 
         let candidate_hash = hash_api_key(raw_key);
 
+        // Revalidate key and project ownership: join with projects table
+        // This guarantees that keys belonging to deleted projects are rejected immediately.
         let row = sqlx::query_as::<
             _,
             (
@@ -234,9 +237,11 @@ impl ApiKeyService {
             ),
         >(
             r#"
-            SELECT id, project_id, name, key_prefix, key_hash, access_policy, enabled, created_at, last_used_at, revoked_at
-            FROM api_keys
-            WHERE key_hash = ?;
+            SELECT k.id, k.project_id, k.name, k.key_prefix, k.key_hash, k.access_policy,
+                   k.enabled, k.created_at, k.last_used_at, k.revoked_at
+            FROM api_keys k
+            INNER JOIN projects p ON k.project_id = p.id
+            WHERE k.key_hash = ?;
             "#,
         )
         .bind(&candidate_hash)
@@ -252,7 +257,7 @@ impl ApiKeyService {
             policy_str,
             enabled,
             created_at,
-            _last_used_at,
+            last_used_at,
             revoked_at,
         ) = match row {
             Some(r) => r,
@@ -264,7 +269,7 @@ impl ApiKeyService {
             return Err(ApiKeyError::InvalidKey);
         }
 
-        // Check revocation
+        // Check revocation - immediate and never cached
         if revoked_at.is_some() {
             return Err(ApiKeyError::Revoked);
         }
@@ -274,13 +279,36 @@ impl ApiKeyService {
             return Err(ApiKeyError::Disabled);
         }
 
-        // Update last_used_at timestamp
-        let now = chrono::Utc::now().to_rfc3339();
-        let _ = sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?;")
-            .bind(&now)
-            .bind(&id)
-            .execute(&self.pool)
-            .await;
+        // Debounced last_used_at update: at most once every 60 seconds per key.
+        // Best-effort execution without blocking authentication or creating write contention.
+        let should_update = match &last_used_at {
+            None => true,
+            Some(ts_str) => {
+                if let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                    let now = chrono::Utc::now();
+                    now.signed_duration_since(last_dt).num_seconds() >= 60
+                } else {
+                    true
+                }
+            }
+        };
+
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let final_last_used = if should_update {
+            let pool = self.pool.clone();
+            let key_id = id.clone();
+            let ts = now_str.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?;")
+                    .bind(&ts)
+                    .bind(&key_id)
+                    .execute(&pool)
+                    .await;
+            });
+            Some(now_str)
+        } else {
+            last_used_at
+        };
 
         let access_policy: AccessPolicy = serde_json::from_str(&policy_str).unwrap_or_default();
 
@@ -293,7 +321,7 @@ impl ApiKeyService {
             access_policy,
             enabled: true,
             created_at,
-            last_used_at: Some(now),
+            last_used_at: final_last_used,
             revoked_at: None,
         })
     }
@@ -369,5 +397,93 @@ impl ApiKeyService {
                 }
             }
         }
+    }
+
+    /// Authorizes a requested model against trusted registry metadata and the key's access policy.
+    /// This is fail-closed: it enforces registry presence, provider status, trusted local provider
+    /// identity, and explicit allowlists. Textual prefix tricks (e.g. "ollama/openai/gpt-4o") fail closed.
+    pub fn authorize_model(
+        &self,
+        key: &ApiKey,
+        concrete_model_id: &str,
+        registry: &ModelRegistry,
+    ) -> Result<ModelInfo, ApiKeyError> {
+        let snapshot = registry.get_snapshot();
+
+        // 1. Registry lookup: model must be registered
+        let model_info = snapshot
+            .models
+            .iter()
+            .find(|m| m.id == concrete_model_id)
+            .cloned()
+            .ok_or_else(|| ApiKeyError::ModelNotFound(concrete_model_id.to_string()))?;
+
+        // 2. Provider must be ready
+        if snapshot.status != ProviderStatus::Ready {
+            return Err(ApiKeyError::ModelNotFound(concrete_model_id.to_string()));
+        }
+
+        // 3. Trusted provider identity & connection classification:
+        // Ollama is currently the verified local provider connected to localhost.
+        let is_trusted_local_provider = model_info.provider_id == "ollama";
+
+        // 4. Evaluate access policy
+        match &key.access_policy {
+            AccessPolicy::LocalOnly => {
+                if !is_trusted_local_provider {
+                    return Err(ApiKeyError::UnauthorizedModel(format!(
+                        "Model '{}' is from non-local provider '{}' and not permitted under local_only policy",
+                        concrete_model_id, model_info.provider_id
+                    )));
+                }
+            }
+            AccessPolicy::SelectedModels { models } => {
+                if !models.contains(&concrete_model_id.to_string()) {
+                    return Err(ApiKeyError::UnauthorizedModel(format!(
+                        "Model '{}' is not in the allowed selected_models list",
+                        concrete_model_id
+                    )));
+                }
+            }
+        }
+
+        Ok(model_info)
+    }
+
+    /// Resolves `auto` deterministically to a concrete model ID eligible under the key's policy.
+    pub fn resolve_auto_model(
+        &self,
+        key: &ApiKey,
+        registry: &ModelRegistry,
+    ) -> Result<ModelInfo, ApiKeyError> {
+        let snapshot = registry.get_snapshot();
+        if snapshot.status != ProviderStatus::Ready {
+            return Err(ApiKeyError::NoEligibleModels);
+        }
+
+        let mut eligible_models: Vec<ModelInfo> = snapshot
+            .models
+            .into_iter()
+            .filter(|m| {
+                // Must support chat (not explicitly embedding-only)
+                if m.capabilities.chat == Some(false) {
+                    return false;
+                }
+                // Check policy
+                match &key.access_policy {
+                    AccessPolicy::LocalOnly => m.provider_id == "ollama",
+                    AccessPolicy::SelectedModels { models } => models.contains(&m.id),
+                }
+            })
+            .collect();
+
+        if eligible_models.is_empty() {
+            return Err(ApiKeyError::NoEligibleModels);
+        }
+
+        // Deterministic ordering by model ID ascending
+        eligible_models.sort_by(|a, b| a.id.cmp(&b.id));
+
+        Ok(eligible_models.remove(0))
     }
 }

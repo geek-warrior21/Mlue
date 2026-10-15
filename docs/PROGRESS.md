@@ -1,6 +1,99 @@
 # mlue Development Progress
 
-## Current Milestone: Brick 3A — Project Management, SQLite Persistence & Secure API Keys
+## Current Milestone: Brick 3B-1 — Authenticated HTTP Inference & First External API Call (Completed)
+
+---
+
+### Milestone: Brick 3B-1 — Authenticated HTTP Inference & First External API Call (Completed)
+
+#### 1. Implemented in Brick 3B-1
+- **Prerequisite Audit & Baseline Commit**: Audited Brick 3A baseline against all 9 acceptance criteria and committed cleanly as `82dd6be`: `feat: add projects and secure api keys`.
+- **Axum Authentication Middleware (`require_api_key`)**:
+  - Implemented strictly typed bearer token authentication enforcing `Authorization: Bearer mlue_sk_<secret>`.
+  - Rejection of missing, malformed, or invalid tokens with standard OpenAI 401 JSON error envelopes (`missing_auth_header`, `invalid_auth_header`, `invalid_api_key`, `revoked_api_key`).
+  - Constant-time secret comparison using `subtle::ConstantTimeEq` preventing timing side-channel attacks.
+  - Immediate rejection of keys belonging to deleted projects via database join (`INNER JOIN projects p ON k.project_id = p.id`).
+  - Debounced asynchronous `last_used_at` timestamp updates (at most once every 60 seconds per key) executed in the background without blocking request latency.
+  - Injected `AuthenticatedKey` context into Axum request extensions for downstream handlers.
+- **Fail-Closed Model Access Policy (`authorize_model`)**:
+  - Validates requested models against trusted internal `ModelRegistry` metadata rather than client string matching.
+  - Enforces `local_only` (restricts to verified local providers like Ollama, blocks foreign models) and `selected_models` (explicit allowlist).
+  - Forged model identifiers and non-existent models are rejected with 404 `model_not_found` or 403 `unauthorized_model`.
+- **Deterministic Auto-Routing (`resolve_auto_model`)**:
+  - When `model: "auto"` is requested, deterministically selects the first permitted, chat-capable model available in the registry.
+  - Returns clear HTTP 400 `no_models_available` if no compatible model exists under the active policy.
+- **OpenAI-Compatible Model Listing (`GET /v1/models`)**:
+  - Returns OpenAI-compatible `{ "object": "list", "data": [ ... ] }` structure.
+  - Strictly filters models to those permitted by the authenticating key's access policy.
+- **OpenAI-Compatible Chat Completions (`POST /v1/chat/completions`)**:
+  - Non-streaming text chat completion handler accepting OpenAI JSON payloads.
+  - Custom `AppJson<T>` extractor enforcing a **256 KiB body limit** and mapping JSON errors to safe OpenAI error structures (HTTP 400 `invalid_json`).
+  - Validates boundaries: max 50 messages, max 64 KiB single message, max 128 KiB total content.
+  - Rejects unsupported roles (roles other than `system`, `user`, `assistant` return HTTP 400 `unsupported_role`).
+  - Rejects unsupported parameters (`tools`, `functions`, etc. return HTTP 400 `unsupported_parameter`).
+  - Rejects streaming (`stream: true` returns HTTP 400 `unsupported_parameter` with explicit notice that HTTP streaming is planned for next milestone).
+  - Returns canonical OpenAI response envelope (`chatcmpl_mlue_...`, `object: "chat.completion"`, choices, finish_reason, token usage).
+- **Concurrency & Capacity Control**:
+  - Direct integration with `InferenceManager` semaphore.
+  - Attempts non-blocking permit acquisition (`try_acquire_permit()`). Returns HTTP 503 `capacity_exceeded` if max concurrent requests are active.
+  - Releases permits automatically via RAII upon request completion or error.
+- **Desktop UI Credentials & Copy Experience (`App.tsx`)**:
+  - Enhanced the one-time key creation modal (`#new-key-secret-box`) with:
+    - Base URL display (`http://127.0.0.1:4782/v1`).
+    - One-time plaintext secret with instant copy button.
+    - "Copy Python Example" button generating working code configured with the new key.
+    - Prominent local-first security notices and streaming status reminder.
+- **Documentation**:
+  - Created `docs/API.md` (complete specification, error catalogue, cURL and Python SDK examples).
+  - Updated `docs/ARCHITECTURE.md` (Section 8 architectural overview, request pipeline, fail-closed policy, concurrency).
+  - Updated `README.md` (quick start guide with API key generation and curl/Python invocation).
+- **Automated Integration Test Suite**:
+  - Implemented 24 rigorous tests in `tests/http_inference_and_auth_tests.rs` covering all required scenarios:
+    1. Missing auth header returns 401.
+    2. Invalid bearer token returns 401.
+    3. Revoked key returns 401.
+    4. Deleted project key returns 401.
+    5. Valid active key authenticates.
+    6. Valid key lists permitted models.
+    7. Restricted key cannot list unauthorized models.
+    8. Restricted key cannot call unauthorized model.
+    9. Forged model identifier cannot bypass authorization.
+    10. Successful completion returns OpenAI envelope.
+    11. Multi-turn messages reach provider correctly.
+    12. Exact upstream model is dispatched.
+    13. `model: "auto"` routes only to permitted models.
+    14. `model: "auto"` returns clear error when no models are permitted.
+    15. `stream: true` is cleanly rejected with 400.
+    16. Unsupported roles and parameters are rejected.
+    17. Invalid JSON returns safe 400 error.
+    18. Excessively large payloads return 413.
+    19. Provider offline / error mapped to OpenAI error response.
+    20. Concurrency limits return 503 capacity_exceeded.
+    21. No plaintext keys appear in logs.
+    22. Immediate key revocation on subsequent requests.
+    23. Non-regression of previous desktop IPC and discovery flows.
+    24. Real OpenAI Python SDK client smoke test.
+
+#### 2. Validation & Testing
+- `cargo fmt --check`: Clean (0 diffs).
+- `cargo check`: Passed.
+- `cargo test`: **97 passed, 0 failed** across all 6 test suites:
+  - `http_inference_and_auth_tests.rs`: 24 passed
+  - `persistence_and_auth_tests.rs`: 18 passed
+  - `streaming_tests.rs`: 22 passed
+  - `inference_tests.rs`: 17 passed
+  - `ollama_discovery_tests.rs`: 10 passed
+  - `server_tests.rs`: 6 passed
+- `cargo clippy --all-targets -- -D warnings`: 0 warnings across all targets.
+- `npm run build`: Production bundle built cleanly (0 errors, 439ms).
+- `cargo build`: Built cleanly with 0 errors.
+
+#### 3. Known Blockers
+- None.
+
+#### 4. Outstanding Work (Next Milestones)
+- **Brick 3B-2 / Brick 4**: Server-Sent Events (SSE) HTTP Streaming for `/v1/chat/completions` (`stream: true`).
+- **Remote Access (Future Milestone)**: Optional authenticated remote connectivity (e.g. Tailscale / wireguard).
 
 ---
 
