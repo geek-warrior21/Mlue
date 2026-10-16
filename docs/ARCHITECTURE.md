@@ -576,4 +576,82 @@ Model authorization never relies on arbitrary client-provided model name strings
 - **`POST /v1/chat/completions`**: Accepts OpenAI-formatted requests and returns `{ "id": "chatcmpl_mlue_...", "object": "chat.completion", "choices": [ ... ], "usage": { ... } }`.
 - **Error Envelopes**: All error responses return standard OpenAI `{ "error": { "message", "type", "param", "code" } }` structures with appropriate HTTP status codes.
 
+---
+
+## 9. OpenAI-Compatible HTTP Streaming, Disconnect Cancellation & Security Hardening (Brick 3B-2)
+
+Brick 3B-2 upgrades the authenticated `POST /v1/chat/completions` endpoint with full Server-Sent Events (SSE) streaming (`stream: true`), disconnect cancellation, backpressure preservation, and HTTP perimeter security hardening.
+
+```
+[ External Client / OpenAI SDK ]
+             │
+             ├──> POST http://127.0.0.1:4782/v1/chat/completions
+             │    Headers: Authorization: Bearer mlue_sk_...
+             │    Body: { "model": "auto", "stream": true, "stream_options": { "include_usage": true } }
+             │
+             ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Embedded Axum HTTP Boundary (127.0.0.1:4782)                                │
+│                                                                             │
+│ 1. Security Middleware (`validate_http_security`):                          │
+│    • Validate Host header in [127.0.0.1, localhost, 127.0.0.1:4782]         │
+│      -> Reject untrusted Host with HTTP 400 invalid_host                    │
+│    • Validate Origin header (if present) against trusted local origins      │
+│      -> Reject untrusted browser Origin with HTTP 403 untrusted_origin      │
+│                                                                             │
+│ 2. Parameter Rejection:                                                     │
+│    • Unsupported generation fields (temperature, max_tokens, tools, etc.)   │
+│      captured via #[serde(flatten)] unsupported_fields                      │
+│      -> Reject with HTTP 400 unsupported_parameter                          │
+│                                                                             │
+│ 3. Fail-Closed Model Authorization & Concurrency Permit:                    │
+│    • Acquire OwnedSemaphorePermit from InferenceManager (capacity bounded) │
+│    • Resolve authorized model via ModelRegistry (no locks held across I/O)  │
+│                                                                             │
+│ 4. SSE Stream Pipeline (`SseStream`):                                       │
+│    • CancellationToken + StreamGuard registered in InferenceManager         │
+│    • Poll InferenceEventStream directly (zero unbounded intermediate queues)│
+│    • Format chunks: role -> delta* -> stop -> [usage] -> data: [DONE]\n\n   │
+│                                                                             │
+│ 5. Disconnect Cancellation:                                                 │
+│    • Client terminates connection / closes TCP socket                       │
+│    • Axum drops response body -> StreamGuard dropped                        │
+│    • CancellationToken cancelled -> Upstream Ollama TCP socket dropped      │
+│    • Concurrency permit released & request untracked                        │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Local Provider (Ollama @ 127.0.0.1:11434)                                   │
+│ • POST /api/chat with {"stream": true}                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.1 Server-Sent Events (SSE) Protocol Implementation
+- **Content-Type**: `text/event-stream; charset=utf-8` with `Cache-Control: no-cache` and `Connection: keep-alive`.
+- **Zero-Unbounded-Queue Backpressure**: `SseStream` implements `futures_util::Stream<Item = Result<axum::body::Bytes, Infallible>>` by directly polling the underlying provider `InferenceEventStream`. It does not use intermediate Tokio unbounded channels (`mpsc::unbounded_channel`), preserving true TCP backpressure from the client to the provider.
+- **Chunk Formatting**:
+  - `Started`: Yields initial role chunk `{"role":"assistant"}`.
+  - `Delta`: Yields content chunk `{"content":"..."}`.
+  - `Completed`: Yields terminal finish chunk `{"finish_reason":"stop"}`.
+  - `include_usage`: If requested, yields an OpenAI-standard usage chunk with `choices: []` and populated `usage`.
+  - Terminal Frame: Yields `data: [DONE]\n\n` exactly once at stream conclusion.
+- **No IPC Routing**: HTTP streaming connects directly from the Axum handler to the provider stream and never traverses Tauri IPC channels, preventing desktop UI serialization overhead.
+
+### 9.2 Client Disconnect Cancellation (`StreamGuard`)
+When an external client disconnects (e.g. user hits Ctrl+C, closes browser, or cancels a stream):
+1. Axum detects the closed TCP socket and drops the downstream response stream.
+2. Dropping the stream invokes the `StreamGuard` destructor (`Drop`).
+3. `StreamGuard::drop` immediately:
+   - Calls `cancellation_token.cancel()`.
+   - The upstream provider worker task detects cancellation and terminates the active HTTP request to Ollama, aborting unnecessary model computation.
+   - Unregisters the request ID from `InferenceManager`.
+   - Drops `OwnedSemaphorePermit`, returning the concurrency permit to the pool.
+
+### 9.3 Security Boundary Hardening
+1. **Host Header Validation**: Every incoming request must present a loopback host header (`127.0.0.1`, `localhost`, or port-qualified variants). Untrusted host headers receive HTTP 400 `invalid_host`.
+2. **Origin Header Validation**: Browser cross-origin requests are checked against allowed local desktop and dev origins (`http://localhost:*`, `http://127.0.0.1:*`, `tauri://localhost`, `http://tauri.localhost`). Untrusted origins receive HTTP 403 `untrusted_origin`. Standard non-browser CLI clients (cURL, Python SDK, LangChain) do not send `Origin` headers and are unaffected.
+3. **Strict Parameter Rejection**: To avoid silent hallucination or unsupported behavior, parameters not yet implemented (`temperature`, `top_p`, `max_tokens`, `tools`, `functions`) are detected via Serde and rejected with HTTP 400 `unsupported_parameter`.
+
+
 

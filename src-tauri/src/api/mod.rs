@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 pub use auth::{AuthenticatedKey, require_api_key};
 pub use chat::{
-    ChatCompletionState, OpenAiChatCompletion, OpenAiChatCompletionRequest,
+    ChatCompletionState, OpenAiChatCompletion, OpenAiChatCompletionChunk,
+    OpenAiChatCompletionRequest, OpenAiChunkChoice, OpenAiChunkDelta, StreamOptions,
     chat_completions_handler,
 };
 pub use error::{ApiError, AppJson, OpenAiErrorResponse};

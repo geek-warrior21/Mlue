@@ -9,7 +9,8 @@ mlue exposes a local-first, OpenAI-compatible HTTP interface powered by an embed
 - **Base URL**: `http://127.0.0.1:4782/v1`
 - **Health Check**: `http://127.0.0.1:4782/health`
 - **Loopback Exclusivity**: The embedded server binds strictly to IPv4 loopback (`127.0.0.1:4782`). It does not bind to `0.0.0.0` or expose open network surfaces to external networks or the internet.
-- **CORS Policy**: Permissive wildcard CORS (`*`) is prohibited. Only local desktop and development origins are accepted.
+- **Host Header Validation**: Requests must present a loopback host header (`127.0.0.1`, `localhost`, or `127.0.0.1:4782`). Untrusted hosts are rejected with HTTP 400 `invalid_host`.
+- **Origin Header Validation**: Browser cross-origin requests are validated. Requests from untrusted origins are rejected with HTTP 403 `untrusted_origin`. Only local development and desktop application origins (`http://localhost:*`, `http://127.0.0.1:*`, `tauri://localhost`, `http://tauri.localhost`) or standard non-browser CLI clients (which omit `Origin`) are accepted. Wildcard CORS (`*`) is prohibited.
 
 ---
 
@@ -90,7 +91,7 @@ Authorization: Bearer mlue_sk_...
 
 ### 3.3 Create Chat Completion
 
-Execute a non-streaming chat completion request against a permitted local model:
+Execute a chat completion request against a permitted local model in either non-streaming (`stream: false`) or streaming (`stream: true`) mode:
 
 ```http
 POST /v1/chat/completions
@@ -115,7 +116,8 @@ Content-Type: application/json
 |---|---|---|---|
 | `model` | string | **Yes** | Model identifier (e.g., `ollama/qwen3:8b`, `qwen3:8b`), or `"auto"` for automatic model resolution. |
 | `messages` | array | **Yes** | Ordered array of message objects. Each object must have `role` (`"system"`, `"user"`, or `"assistant"`) and `content` (string). |
-| `stream` | boolean | No | Must be `false` or omitted. HTTP streaming is not supported in this version. |
+| `stream` | boolean | No | Optional, defaults to `false`. When `true`, returns a Server-Sent Events (SSE) stream (`text/event-stream; charset=utf-8`). |
+| `stream_options` | object | No | Optional. Supported options: `include_usage` (boolean). When `true` and `stream: true`, an additional chunk containing token usage is emitted prior to `[DONE]`. |
 
 #### Request Limits & Validation Constraints
 - **Payload Size**: Maximum request body size is **256 KiB** (enforced at HTTP layer). Payloads exceeding this limit receive HTTP 413 `request_too_large`.
@@ -123,10 +125,9 @@ Content-Type: application/json
 - **Single Message Size**: Maximum **64 KiB** per message content.
 - **Total Messages Size**: Maximum **128 KiB** total text content across all messages.
 - **Unsupported Roles**: Roles other than `system`, `user`, or `assistant` (e.g. `tool`, `function`) return HTTP 400 `unsupported_role`.
-- **Unsupported Parameters**: Passing `tools`, `functions`, `tool_choice`, or `function_call` returns HTTP 400 `unsupported_parameter`.
-- **Streaming Policy**: Specifying `"stream": true` returns HTTP 400 `unsupported_parameter` with a descriptive message that HTTP streaming is planned for a future milestone.
+- **Strict Parameter Rejection**: Passing unsupported parameters (e.g. `temperature`, `top_p`, `max_tokens`, `tools`, `functions`, `tool_choice`, `function_call`) returns HTTP 400 `unsupported_parameter` with the name of the rejected parameter.
 
-#### Response (`200 OK`)
+#### Non-Streaming Response (`200 OK`, `stream: false`)
 ```json
 {
   "id": "chatcmpl_mlue_019234ab-5678-7123-8abc-def012345678",
@@ -150,6 +151,52 @@ Content-Type: application/json
   }
 }
 ```
+
+---
+
+### 3.4 Streaming Chat Completion (`stream: true`)
+
+When `stream: true` is passed, the endpoint returns an OpenAI-compatible Server-Sent Events (SSE) stream with `Content-Type: text/event-stream; charset=utf-8` and headers `Cache-Control: no-cache` and `Connection: keep-alive`.
+
+#### Streaming Chunk Format
+Each SSE data event is prefixed with `data: ` and formatted as a JSON `chat.completion.chunk` object, terminated with double newlines (`\n\n`):
+
+1. **Initial Role Chunk**:
+```sse
+data: {"id":"chatcmpl_mlue_...","object":"chat.completion.chunk","created":1711281605,"model":"ollama/qwen3:8b","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+```
+
+2. **Incremental Delta Chunks**:
+```sse
+data: {"id":"chatcmpl_mlue_...","object":"chat.completion.chunk","created":1711281605,"model":"ollama/qwen3:8b","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+```
+
+3. **Terminal Completion Chunk**:
+```sse
+data: {"id":"chatcmpl_mlue_...","object":"chat.completion.chunk","created":1711281605,"model":"ollama/qwen3:8b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+```
+
+4. **Optional Usage Chunk** (when `stream_options.include_usage: true`):
+```sse
+data: {"id":"chatcmpl_mlue_...","object":"chat.completion.chunk","created":1711281605,"model":"ollama/qwen3:8b","choices":[],"usage":{"prompt_tokens":28,"completion_tokens":14,"total_tokens":42}}
+
+```
+
+5. **Terminal Done Event**:
+```sse
+data: [DONE]
+
+```
+
+#### Disconnect Cancellation Mechanics
+If an external HTTP client closes the connection, aborts reading, or terminates early:
+1. Axum detects the dropped socket and drops the downstream response stream.
+2. The internal `StreamGuard` RAII handle triggers an immediate cancellation on the associated Tokio `CancellationToken`.
+3. Upstream HTTP connection to the provider (Ollama) is immediately terminated, stopping unnecessary model compute.
+4. Active request tracking is purged from `InferenceManager` and the concurrency semaphore permit is immediately returned.
 
 ---
 
@@ -190,9 +237,10 @@ All errors conform to the standard OpenAI JSON error envelope:
 
 | HTTP Status | Error Type | Error Code | Description |
 |---|---|---|---|
+| `400 Bad Request` | `invalid_request_error` | `invalid_host` | Untrusted or non-loopback `Host` header provided. |
 | `400 Bad Request` | `invalid_request_error` | `invalid_json` | Request body is not well-formed JSON. |
 | `400 Bad Request` | `invalid_request_error` | `invalid_request_error` | Missing required fields (`messages`, empty array, empty content). |
-| `400 Bad Request` | `invalid_request_error` | `unsupported_parameter` | Unsupported options supplied (e.g. `stream: true`, `tools`, `functions`). |
+| `400 Bad Request` | `invalid_request_error` | `unsupported_parameter` | Unsupported generation parameter supplied (e.g. `temperature`, `max_tokens`, `tools`, `functions`). |
 | `400 Bad Request` | `invalid_request_error` | `unsupported_role` | Message role is not `system`, `user`, or `assistant`. |
 | `400 Bad Request` | `invalid_request_error` | `unsupported_capability` | Requested model is an embedding model or lacks chat capability. |
 | `400 Bad Request` | `invalid_request_error` | `no_models_available` | `model: "auto"` could not find any eligible chat model under the key policy. |
@@ -200,6 +248,7 @@ All errors conform to the standard OpenAI JSON error envelope:
 | `401 Unauthorized` | `invalid_request_error` | `invalid_auth_header` | Header format is invalid (must be `Bearer mlue_sk_<secret>`). |
 | `401 Unauthorized` | `invalid_request_error` | `invalid_api_key` | Secret key does not match any active key, or parent project was deleted. |
 | `401 Unauthorized` | `invalid_request_error` | `revoked_api_key` | Key has been revoked. |
+| `403 Forbidden` | `invalid_request_error` | `untrusted_origin` | Cross-origin browser request from untrusted `Origin` header rejected. |
 | `403 Forbidden` | `invalid_request_error` | `unauthorized_model` | Model is not permitted under the key's access policy. |
 | `404 Not Found` | `invalid_request_error` | `model_not_found` | Requested model is not discovered or registered. |
 | `413 Payload Too Large` | `invalid_request_error` | `request_too_large` | Request body exceeds 256 KiB limit, or messages exceed limits (max 50, 64 KiB single, 128 KiB total). |
@@ -221,20 +270,7 @@ curl -X GET http://127.0.0.1:4782/v1/models \
   -H "Authorization: Bearer mlue_sk_YOUR_SECRET_KEY"
 ```
 
-#### Chat Completion (Specific Model)
-```bash
-curl -X POST http://127.0.0.1:4782/v1/chat/completions \
-  -H "Authorization: Bearer mlue_sk_YOUR_SECRET_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "ollama/qwen3:8b",
-    "messages": [
-      { "role": "user", "content": "Explain Rust ownership in two sentences." }
-    ]
-  }'
-```
-
-#### Chat Completion (Automatic Model Routing)
+#### Non-Streaming Chat Completion
 ```bash
 curl -X POST http://127.0.0.1:4782/v1/chat/completions \
   -H "Authorization: Bearer mlue_sk_YOUR_SECRET_KEY" \
@@ -242,8 +278,26 @@ curl -X POST http://127.0.0.1:4782/v1/chat/completions \
   -d '{
     "model": "auto",
     "messages": [
-      { "role": "user", "content": "Hello mlue!" }
-    ]
+      { "role": "user", "content": "Explain Rust ownership in two sentences." }
+    ],
+    "stream": false
+  }'
+```
+
+#### Real-Time Streaming Chat Completion (SSE)
+```bash
+curl -N -X POST http://127.0.0.1:4782/v1/chat/completions \
+  -H "Authorization: Bearer mlue_sk_YOUR_SECRET_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [
+      { "role": "user", "content": "Count from 1 to 5 slowly." }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
   }'
 ```
 
@@ -256,12 +310,11 @@ Install the OpenAI client:
 pip install openai
 ```
 
-Execute an inference completion:
+#### Non-Streaming Example
 ```python
 import os
 from openai import OpenAI
 
-# Point client to the local mlue runtime
 client = OpenAI(
     base_url="http://127.0.0.1:4782/v1",
     api_key=os.environ.get("MLUE_API_KEY", "mlue_sk_YOUR_SECRET_KEY"),
@@ -271,9 +324,9 @@ client = OpenAI(
 models = client.models.list()
 print("Discovered models:", [m.id for m in models.data])
 
-# 2. Generate a completion
+# 2. Generate a non-streaming completion
 response = client.chat.completions.create(
-    model="auto",  # or a specific model like "ollama/qwen3:8b"
+    model="auto",
     messages=[
         {"role": "system", "content": "You are a concise engineering assistant."},
         {"role": "user", "content": "What is the capital of France?"},
@@ -283,4 +336,32 @@ response = client.chat.completions.create(
 
 print("Response:", response.choices[0].message.content)
 print("Tokens used:", response.usage.total_tokens)
+```
+
+#### Real-Time Streaming Example
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4782/v1",
+    api_key=os.environ.get("MLUE_API_KEY", "mlue_sk_YOUR_SECRET_KEY"),
+)
+
+# Generate a streaming completion
+stream = client.chat.completions.create(
+    model="auto",
+    messages=[
+        {"role": "user", "content": "Write a haiku about local AI sovereignty."},
+    ],
+    stream=True,
+    stream_options={"include_usage": True},
+)
+
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+    if chunk.usage:
+        print(f"\n[Usage: {chunk.usage.total_tokens} tokens]")
+print()
 ```

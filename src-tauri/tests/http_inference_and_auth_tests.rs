@@ -88,21 +88,46 @@ async fn mock_chat_handler(
         .and_then(|c| c.as_str())
         .unwrap_or("Hello");
 
-    let response_text = format!("Echo: {}", last_content);
+    let is_streaming = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    Json(json!({
-        "model": body.get("model").and_then(|v| v.as_str()).unwrap_or("qwen3:8b"),
-        "created_at": "2024-03-24T12:00:05Z",
-        "message": {
-            "role": "assistant",
-            "content": response_text
-        },
-        "done": true,
-        "done_reason": "stop",
-        "prompt_eval_count": 12,
-        "eval_count": 6
-    }))
-    .into_response()
+    if is_streaming {
+        let chunks = vec![
+            Ok::<_, std::io::Error>(bytes::Bytes::from(
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"Echo: \"},\"done\":false}\n",
+            )),
+            Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+                "{{\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\"done\":false}}\n",
+                last_content
+            ))),
+            Ok::<_, std::io::Error>(bytes::Bytes::from(
+                "{\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":12,\"eval_count\":6}\n",
+            )),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("Content-Type", "application/x-ndjson")
+            .body(axum::body::Body::from_stream(stream))
+            .unwrap()
+    } else {
+        let response_text = format!("Echo: {}", last_content);
+        Json(json!({
+            "model": body.get("model").and_then(|v| v.as_str()).unwrap_or("qwen3:8b"),
+            "created_at": "2024-03-24T12:00:05Z",
+            "message": {
+                "role": "assistant",
+                "content": response_text
+            },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 12,
+            "eval_count": 6
+        }))
+        .into_response()
+    }
 }
 
 struct TestFixture {
@@ -716,9 +741,9 @@ async fn test_14_auto_returns_clear_error_when_no_permitted_model_exists() {
     assert_eq!(body["error"]["code"], "no_models_available");
 }
 
-// 15. Unsupported streaming request is rejected clearly.
+// 15. Streaming request is supported and returns SSE stream.
 #[tokio::test]
-async fn test_15_unsupported_streaming_request_rejected() {
+async fn test_15_streaming_request_returns_sse_stream() {
     let fixture = TestFixture::new().await;
     let proj = fixture
         .project_service
@@ -744,15 +769,18 @@ async fn test_15_unsupported_streaming_request_rejected() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("HTTP streaming is not supported in this version")
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        res.headers().get("content-type").unwrap(),
+        "text/event-stream"
     );
+
+    let body = res.text().await.unwrap();
+    assert!(body.contains("chat.completion.chunk"));
+    assert!(body.contains("Echo: "));
+    assert!(body.contains("Stream me"));
+    assert!(body.contains("\"finish_reason\":\"stop\""));
+    assert!(body.contains("data: [DONE]"));
 }
 
 // 16. Unsupported roles and parameters are rejected.
@@ -1258,4 +1286,183 @@ async fn test_28_unsupported_generation_parameters_rejected() {
     assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
+}
+
+// 29. Streaming chat completion with include_usage emits final usage chunk with choices: [].
+#[tokio::test]
+async fn test_29_streaming_chat_completion_with_usage() {
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("Usage Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Usage Key", None)
+        .await
+        .unwrap();
+
+    let res = fixture
+        .client
+        .post(format!("{}/v1/chat/completions", fixture.server_endpoint))
+        .header("Authorization", format!("Bearer {}", key.full_key))
+        .json(&json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Count tokens"}],
+            "stream": true,
+            "stream_options": {
+                "include_usage": true
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body = res.text().await.unwrap();
+
+    // Verify usage chunk is emitted
+    assert!(body.contains("\"choices\":[]"));
+    assert!(
+        body.contains(
+            "\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":6,\"total_tokens\":18}"
+        )
+    );
+    assert!(body.contains("data: [DONE]"));
+}
+
+// 30. Dropping client stream terminates request, cleans up tracking, and releases permit.
+#[tokio::test]
+async fn test_30_streaming_disconnect_cancels_upstream_and_releases_permit() {
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("Disconnect Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Disconnect Key", None)
+        .await
+        .unwrap();
+
+    let res = fixture
+        .client
+        .post(format!("{}/v1/chat/completions", fixture.server_endpoint))
+        .header("Authorization", format!("Bearer {}", key.full_key))
+        .json(&json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Slow stream"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+    // Read only the first chunk from the stream
+    let mut stream = res.bytes_stream();
+    use futures_util::StreamExt;
+    let first_chunk = stream.next().await;
+    assert!(first_chunk.is_some());
+
+    // Drop the response stream prematurely, simulating client disconnect
+    drop(stream);
+
+    // Wait briefly for drop to take effect
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Verify active tracking is 0
+    assert_eq!(fixture.inference_manager.active_count(), 0);
+
+    // Verify capacity was released: we can acquire 2 permits
+    let p1 = fixture.inference_manager.try_acquire_permit();
+    let p2 = fixture.inference_manager.try_acquire_permit();
+    assert!(p1.is_ok());
+    assert!(p2.is_ok());
+}
+
+// 31. OpenAI Python SDK streaming smoke test.
+#[tokio::test]
+async fn test_31_openai_python_sdk_streaming_smoke_test() {
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("PyStream Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "PyStream Key", None)
+        .await
+        .unwrap();
+
+    let python_binary = "/Users/gyan/Desktop/Mlue/scratch_pyenv/bin/python3";
+    if !std::path::Path::new(python_binary).exists() {
+        eprintln!(
+            "Python virtualenv binary not found at {}, skipping python SDK invocation",
+            python_binary
+        );
+        return;
+    }
+
+    let script = format!(
+        r#"
+import sys
+from openai import OpenAI
+
+try:
+    client = OpenAI(
+        base_url="{}/v1",
+        api_key="{}"
+    )
+
+    stream = client.chat.completions.create(
+        model="auto",
+        messages=[
+            {{"role": "user", "content": "Stream Python"}}
+        ],
+        stream=True
+    )
+
+    collected = []
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            collected.append(chunk.choices[0].delta.content)
+
+    result_text = "".join(collected)
+    print("PYTHON_STREAM_RESULT:" + result_text)
+    sys.exit(0)
+except Exception as e:
+    print(f"FAIL: Exception: {{e}}", file=sys.stderr)
+    sys.exit(2)
+"#,
+        fixture.server_endpoint, key.full_key
+    );
+
+    let output = tokio::process::Command::new(python_binary)
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .await
+        .expect("Failed to execute python SDK script");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Python streaming SDK test failed with code {:?}. Stderr: {}\nStdout: {}",
+        output.status.code(),
+        stderr,
+        stdout
+    );
+
+    assert!(
+        stdout.contains("PYTHON_STREAM_RESULT:Echo: Stream Python"),
+        "Unexpected Python output: {}",
+        stdout
+    );
 }

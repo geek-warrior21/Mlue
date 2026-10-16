@@ -1,6 +1,61 @@
 # mlue Development Progress
 
-## Current Milestone: Brick 3B-1 — Authenticated HTTP Inference & First External API Call (Completed)
+## Current Milestone: Brick 3B-2 — OpenAI-Compatible HTTP Streaming, Disconnect Cancellation & Security Hardening (Completed)
+
+---
+
+### Milestone: Brick 3B-2 — OpenAI-Compatible HTTP Streaming, Disconnect Cancellation & Security Hardening (Completed)
+
+#### 1. Implemented in Brick 3B-2
+- **Prerequisite Audit & Baseline Commit**: Completed full audit of Brick 3B-1 requirements, validated against all 24 existing tests, and committed baseline as `77b3d59`: `feat: expose authenticated openai-compatible inference api`.
+- **OpenAI-Compatible Server-Sent Events (SSE) Streaming (`stream: true`)**:
+  - Upgraded `POST /v1/chat/completions` to support streaming mode returning `text/event-stream; charset=utf-8`.
+  - Defined OpenAI-compatible chunk structures: `OpenAiChatCompletionChunk`, `OpenAiChunkChoice`, `OpenAiChunkDelta`.
+  - Sequential chunk delivery: Initial assistant role chunk (`{"role":"assistant"}`), incremental text deltas (`{"content":"..."}`), completion finish chunk (`choices[0].finish_reason: "stop"`), optional usage chunk (`choices: []`, populated `usage`), and final terminal frame `data: [DONE]\n\n`.
+  - Full support for `stream_options.include_usage: true` emitting token counts per OpenAI spec.
+  - No intermediate unbounded Tokio queues: `SseStream` directly implements `futures_util::Stream` polling `InferenceEventStream` to preserve backpressure from provider to external client.
+  - Zero IPC overhead: HTTP streaming bypasses Tauri IPC channels and communicates directly from Axum to the provider stream.
+- **Client Disconnect Cancellation & Resource Recovery (`StreamGuard`)**:
+  - Implemented `StreamGuard` RAII destructor attached to the SSE stream.
+  - When the HTTP client terminates connection or closes the socket, Axum drops the stream, immediately triggering `StreamGuard::drop`.
+  - The drop handler triggers `cancellation_token.cancel()`, which immediately aborts the active upstream HTTP connection to Ollama, untracks the request in `InferenceManager`, and releases the concurrency semaphore permit.
+- **HTTP Boundary Hardening**:
+  - **Host Header Validation**: Implemented security middleware rejecting requests whose `Host` header is not a loopback address (`127.0.0.1`, `localhost`, or port-qualified variants) with structured HTTP 400 `invalid_host`.
+  - **Origin Header Validation**: Rejects untrusted browser cross-origin requests with HTTP 403 `untrusted_origin`. Permits trusted desktop/dev origins (`http://localhost:*`, `http://127.0.0.1:*`, `tauri://localhost`, `http://tauri.localhost`) or non-browser CLI callers.
+  - **Strict Parameter Rejection**: Added `#[serde(flatten)] unsupported_fields` to detect and reject unimplemented generation parameters (`temperature`, `top_p`, `max_tokens`, `tools`, `functions`, etc.) with structured HTTP 400 `unsupported_parameter`.
+- **Automated Integration Test Suite**:
+  - Expanded `tests/http_inference_and_auth_tests.rs` to 31 tests (all passing):
+    - Added test 25: Untrusted Host header rejected with 400 `invalid_host`.
+    - Added test 26: Untrusted Origin header rejected with 403 `untrusted_origin`.
+    - Added test 27: Trusted local origins accepted.
+    - Added test 28: Unsupported generation parameters rejected with 400 `unsupported_parameter`.
+    - Added test 29: Streaming chat completion with `stream_options.include_usage` asserts `choices: []` and populated usage before `[DONE]`.
+    - Added test 30: Client disconnect cancellation immediately cancels upstream request and releases semaphore permit.
+    - Added test 31: End-to-end OpenAI Python SDK streaming client smoke test.
+  - Preserved existing non-streaming test suite (all 24 previous tests continue passing with zero regressions).
+- **Packaging & Bundle Verification**:
+  - Verified `npm run tauri build -- --debug` cleanly generates macOS application (`mlue.app`, 52.70 MiB) and disk image (`mlue_0.1.0_aarch64.dmg`, 12.49 MiB).
+
+#### 2. Validation & Testing
+- `cargo fmt --check`: Clean (0 diffs).
+- `cargo check`: Passed.
+- `cargo clippy --all-targets -- -D warnings`: Clean (0 warnings across all targets).
+- `cargo test`: **104 passed, 0 failed** across all 6 test suites:
+  - `http_inference_and_auth_tests.rs`: 31 passed
+  - `persistence_and_auth_tests.rs`: 18 passed
+  - `streaming_tests.rs`: 22 passed
+  - `inference_tests.rs`: 17 passed
+  - `ollama_discovery_tests.rs`: 10 passed
+  - `server_tests.rs`: 6 passed
+- `npm run build`: Production bundle built cleanly (0 errors, 648ms).
+- `npm run tauri build -- --debug`: Successfully packaged macOS native application and DMG installer.
+
+#### 3. Known Blockers
+- None.
+
+#### 4. Outstanding Work (Next Milestones)
+- **Brick 4**: Multiple local engine adapters (e.g. LM Studio, llama.cpp, vLLM) and optional remote providers (OpenAI, Anthropic, Gemini).
+- **Remote Access (Future Milestone)**: Optional authenticated remote connectivity (e.g. Tailscale / wireguard).
 
 ---
 

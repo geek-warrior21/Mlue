@@ -64,6 +64,14 @@ mlue is a local-first desktop application that allows users to expose supported 
 - **Resource Limits & Concurrency**: Enforces 256 KiB body limit, 50 message cap, 64 KiB single message cap, 128 KiB total content cap, and global semaphore concurrency control.
 - **Desktop UI Experience**: One-time key generation modal presents endpoint URL, copyable secret, and instant Python SDK copy-paste example.
 
+### Brick 3B-2 — OpenAI-Compatible HTTP Streaming, Disconnect Cancellation & Security Hardening
+- **Server-Sent Events (SSE) Streaming**: `POST /v1/chat/completions` supports `stream: true`, emitting OpenAI `chat.completion.chunk` events and `data: [DONE]`.
+- **Token Usage Option**: Supports `stream_options.include_usage: true` emitting token counts in a trailing chunk per OpenAI specification.
+- **Zero-Unbounded-Queue Backpressure**: `SseStream` polls provider stream directly without intermediate memory queues.
+- **Immediate Disconnect Cancellation**: Dropping client connections triggers `StreamGuard` RAII teardown, immediately killing upstream Ollama requests and releasing concurrency permits.
+- **Host & Origin Validation**: Rejects untrusted Host headers (HTTP 400 `invalid_host`) and untrusted browser Origin headers (HTTP 403 `untrusted_origin`).
+- **Strict Parameter Rejection**: Rejects unimplemented parameters (`temperature`, `max_tokens`, `tools`, etc.) with HTTP 400 `unsupported_parameter`.
+
 ---
 
 ## Prerequisites
@@ -121,6 +129,8 @@ curl -X GET http://127.0.0.1:4782/v1/models \
 ```
 
 ### 4. Run a Chat Completion via cURL
+
+#### Non-Streaming
 ```bash
 curl -X POST http://127.0.0.1:4782/v1/chat/completions \
   -H "Authorization: Bearer mlue_sk_YOUR_SECRET" \
@@ -129,11 +139,28 @@ curl -X POST http://127.0.0.1:4782/v1/chat/completions \
     "model": "auto",
     "messages": [
       { "role": "user", "content": "Hello mlue! Are you working?" }
-    ]
+    ],
+    "stream": false
+  }'
+```
+
+#### Real-Time Streaming (SSE)
+```bash
+curl -N -X POST http://127.0.0.1:4782/v1/chat/completions \
+  -H "Authorization: Bearer mlue_sk_YOUR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [
+      { "role": "user", "content": "Count from 1 to 5 slowly." }
+    ],
+    "stream": true
   }'
 ```
 
 ### 5. Run via OpenAI Python SDK
+
+#### Non-Streaming
 ```python
 from openai import OpenAI
 
@@ -151,13 +178,36 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+#### Real-Time Streaming
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:4782/v1",
+    api_key="mlue_sk_YOUR_SECRET",
+)
+
+stream = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "Write a haiku about local AI sovereignty."}],
+    stream=True,
+    stream_options={"include_usage": True},
+)
+
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+    if chunk.usage:
+        print(f"\n[Usage: {chunk.usage.total_tokens} tokens]")
+print()
+```
+
 ---
 
 ## What is NOT Implemented Yet (Planned for Future Bricks)
 
-The following capabilities are deliberately out of scope for Brick 3B-1:
+The following capabilities are deliberately out of scope for Brick 3B-2:
 
-- Server-Sent Events (SSE) HTTP Streaming for `/v1/chat/completions` (`stream: true`)
 - Cloud provider connections (OpenAI, Gemini, Anthropic)
 - Public networking / remote tunnels (Tailscale / wireguard)
 - Automatic model downloading or pulling workflows
