@@ -1466,3 +1466,249 @@ except Exception as e:
         stdout
     );
 }
+
+// 33. Brick 4A: CORS preflight requests from browser/webview origins (localhost:1420, tauri://localhost) succeed
+#[tokio::test]
+async fn test_33_brick4a_cors_preflight_webview_origins() {
+    let fixture = TestFixture::new().await;
+
+    for origin in &[
+        "http://localhost:1420",
+        "tauri://localhost",
+        "http://tauri.localhost",
+    ] {
+        let res = fixture
+            .client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{}/v1/chat/completions", fixture.server_endpoint),
+            )
+            .header("Origin", *origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header(
+                "Access-Control-Request-Headers",
+                "authorization, content-type",
+            )
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            reqwest::StatusCode::OK,
+            "Preflight failed for origin {}",
+            origin
+        );
+        let allow_origin = res
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok());
+        assert_eq!(allow_origin, Some(*origin));
+    }
+}
+
+// 34. Brick 4A: Untrusted browser origin is rejected with 403 Forbidden
+#[tokio::test]
+async fn test_34_brick4a_untrusted_origin_rejected() {
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("Security Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Sec Key", None)
+        .await
+        .unwrap();
+
+    let res = fixture
+        .client
+        .post(format!("{}/v1/chat/completions", fixture.server_endpoint))
+        .header("Origin", "http://evil-attacker-site.com")
+        .header("Authorization", format!("Bearer {}", key.full_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+// 35. Brick 4A: Onboarding persistence ensures no duplicate projects or silent key leaks
+#[tokio::test]
+async fn test_35_brick4a_onboarding_no_duplicate_projects_or_keys() {
+    let fixture = TestFixture::new().await;
+
+    // Initially no projects
+    let initial_projects = fixture.project_service.list_projects().await.unwrap();
+    assert_eq!(initial_projects.len(), 0);
+
+    // Create single project
+    let proj = fixture
+        .project_service
+        .create_project("Default", None)
+        .await
+        .unwrap();
+    let listed = fixture.project_service.list_projects().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, proj.id);
+
+    // Create onboarding key
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Onboarding Key", None)
+        .await
+        .unwrap();
+    assert!(key.full_key.starts_with("mlue_sk_"));
+    assert!(key.full_key.len() > 40);
+
+    // Verify key metadata does NOT contain the plaintext key
+    let listed_keys = fixture.key_service.list_keys(&proj.id).await.unwrap();
+    assert_eq!(listed_keys.len(), 1);
+    assert_eq!(listed_keys[0].id, key.metadata.id);
+    assert_eq!(listed_keys[0].key_prefix, key.metadata.key_prefix);
+    // There is no plaintext field in ApiKeyMetadata
+}
+
+// 36. Brick 4A: One-click verification calls real HTTP /v1/chat/completions endpoint
+#[tokio::test]
+async fn test_36_brick4a_one_click_verification_real_http_call() {
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("One-Click Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Test Key", None)
+        .await
+        .unwrap();
+
+    // 1. Success case: authenticated call
+    let res = fixture
+        .client
+        .post(format!("{}/v1/chat/completions", fixture.server_endpoint))
+        .header("Authorization", format!("Bearer {}", key.full_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Explain sovereignty"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert!(
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Echo: Explain sovereignty")
+    );
+    assert!(body["usage"]["total_tokens"].as_i64().unwrap() > 0);
+
+    // 2. Error case: invalid key returns 401
+    let bad_res = fixture
+        .client
+        .post(format!("{}/v1/chat/completions", fixture.server_endpoint))
+        .header(
+            "Authorization",
+            "Bearer mlue_sk_invalid_test_key_1234567890abcdef1234567890",
+        )
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "auto",
+            "messages": [{"role": "user", "content": "Explain sovereignty"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(bad_res.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let bad_body: Value = bad_res.json().await.unwrap();
+    assert_eq!(bad_body["error"]["code"], "invalid_api_key");
+}
+
+// 37. Brick 4A: Arbitrary localhost origins (e.g. port 8080, 3000) are rejected with 403 Forbidden
+#[tokio::test]
+async fn test_37_brick4a_arbitrary_localhost_origin_rejected() {
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("Port Security Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Port Sec Key", None)
+        .await
+        .unwrap();
+
+    for bad_origin in &[
+        "http://localhost:8080",
+        "http://localhost:3000",
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:9999",
+    ] {
+        let res = fixture
+            .client
+            .post(format!("{}/v1/chat/completions", fixture.server_endpoint))
+            .header("Origin", *bad_origin)
+            .header("Authorization", format!("Bearer {}", key.full_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "Arbitrary origin {} should be forbidden",
+            bad_origin
+        );
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "untrusted_origin");
+    }
+}
+
+// 38. Brick 4A: Untrusted Host header is rejected with 400 Bad Request
+#[tokio::test]
+async fn test_38_brick4a_untrusted_host_header_rejected() {
+    let fixture = TestFixture::new().await;
+
+    for bad_host in &[
+        "attacker.com",
+        "evil.org:4782",
+        "192.168.1.50:4782",
+        "example.com",
+    ] {
+        let res = fixture
+            .client
+            .get(format!("{}/health", fixture.server_endpoint))
+            .header("Host", *bad_host)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            res.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "Untrusted host {} should be bad request",
+            bad_host
+        );
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_host");
+    }
+}

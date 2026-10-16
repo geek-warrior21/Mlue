@@ -39,23 +39,33 @@ pub enum ServerError {
     ServeError(String),
 }
 
-pub fn build_app_router() -> axum::Router {
-    // Explicit CORS configuration restricting origins and methods; avoids wildcard origins
-    let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:1420".parse::<HeaderValue>().unwrap(),
-            "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
-            "tauri://localhost".parse::<HeaderValue>().unwrap(),
-            "http://127.0.0.1:1420".parse::<HeaderValue>().unwrap(),
-        ])
+pub fn get_cors_layer() -> CorsLayer {
+    #[cfg(debug_assertions)]
+    let allowed = [
+        "tauri://localhost".parse::<HeaderValue>().unwrap(),
+        "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
+        "http://localhost:1420".parse::<HeaderValue>().unwrap(),
+        "http://127.0.0.1:1420".parse::<HeaderValue>().unwrap(),
+    ];
+
+    #[cfg(not(debug_assertions))]
+    let allowed = [
+        "tauri://localhost".parse::<HeaderValue>().unwrap(),
+        "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
+    ];
+
+    CorsLayer::new()
+        .allow_origin(allowed)
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             axum::http::header::AUTHORIZATION,
             axum::http::header::CONTENT_TYPE,
-        ]);
+        ])
+}
 
+pub fn build_app_router() -> axum::Router {
     create_router()
-        .layer(cors)
+        .layer(get_cors_layer())
         .layer(axum::middleware::from_fn(
             crate::api::security::validate_host_and_origin,
         ))
@@ -63,19 +73,6 @@ pub fn build_app_router() -> axum::Router {
 }
 
 pub fn build_app_router_with_context(context: ServerContext) -> axum::Router {
-    let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:1420".parse::<HeaderValue>().unwrap(),
-            "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
-            "tauri://localhost".parse::<HeaderValue>().unwrap(),
-            "http://127.0.0.1:1420".parse::<HeaderValue>().unwrap(),
-        ])
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([
-            axum::http::header::AUTHORIZATION,
-            axum::http::header::CONTENT_TYPE,
-        ]);
-
     let api_ctx = crate::api::ApiRouterContext {
         model_registry: context.model_registry,
         ollama_provider: context.ollama_provider,
@@ -84,7 +81,7 @@ pub fn build_app_router_with_context(context: ServerContext) -> axum::Router {
     };
 
     crate::api::create_api_router(api_ctx)
-        .layer(cors)
+        .layer(get_cors_layer())
         .layer(axum::middleware::from_fn(
             crate::api::security::validate_host_and_origin,
         ))

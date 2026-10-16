@@ -650,8 +650,67 @@ When an external client disconnects (e.g. user hits Ctrl+C, closes browser, or c
 
 ### 9.3 Security Boundary Hardening
 1. **Host Header Validation**: Every incoming request must present a loopback host header (`127.0.0.1`, `localhost`, or port-qualified variants). Untrusted host headers receive HTTP 400 `invalid_host`.
-2. **Origin Header Validation**: Browser cross-origin requests are checked against allowed local desktop and dev origins (`http://localhost:*`, `http://127.0.0.1:*`, `tauri://localhost`, `http://tauri.localhost`). Untrusted origins receive HTTP 403 `untrusted_origin`. Standard non-browser CLI clients (cURL, Python SDK, LangChain) do not send `Origin` headers and are unaffected.
+2. **Origin Header Validation**: Browser cross-origin requests are strictly validated. In production builds, only exact packaged Tauri schemes (`tauri://localhost`, `http://tauri.localhost`) are permitted. In development mode (`debug_assertions`), exact Vite dev ports (`http://localhost:1420`, `http://127.0.0.1:1420`) are additionally permitted. Arbitrary localhost ports (e.g. `http://localhost:8080`) and external domains are rejected with HTTP 403 `untrusted_origin`. Standard non-browser CLI clients (cURL, Python SDK, LangChain) do not send `Origin` headers and remain unaffected.
 3. **Strict Parameter Rejection**: To avoid silent hallucination or unsupported behavior, parameters not yet implemented (`temperature`, `top_p`, `max_tokens`, `tools`, `functions`) are detected via Serde and rejected with HTTP 400 `unsupported_parameter`.
+
+---
+
+## 10. First-Run Onboarding & One-Click API Verification (Brick 4A)
+
+Brick 4A introduces a unified first-run user onboarding flow and an instant one-click HTTP API verification mechanism in the desktop frontend, validating end-to-end connectivity without bypassing any core security or networking boundaries.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ desktop UI (`App.tsx` — Onboarding & Verification Component)                │
+│                                                                             │
+│  [ Step 1: Model ]  ───>  [ Step 2: Project ]  ───>  [ Step 3: API Key ]    │
+│  (Discovered Ollama)     (Select / Create)           (Generate Secret)      │
+│                                                              │              │
+│                                                              ▼              │
+│                                                   [ Step 4: Test My API ]   │
+└──────────────────────────────────────────────────────────────┬──────────────┘
+                                                               │
+                                         Real Browser `fetch`  │
+                                         or `verify_http_api_call` (loopback)
+                                         POST /v1/chat/completions
+                                         Headers: Authorization, Content-Type
+                                                               │
+                                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Embedded Axum HTTP Boundary (http://127.0.0.1:4782)                         │
+│                                                                             │
+│ 1. CORS Preflight & Origin Validation (tauri:// in prod; 1420 in dev)       │
+│ 2. Constant-Time API Key Hash Verification (`subtle::ConstantTimeEq`)       │
+│ 3. Concurrency Semaphore & Model Registry Access Policy Evaluation          │
+│ 4. SSE Stream or Non-Streaming JSON Response Generation                     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Local Provider (Ollama Engine @ http://127.0.0.1:11434)                     │
+│ • Real model inference with llama3.2:1b                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.1 Architectural Invariants & Verification Guarantees
+1. **Real HTTP Verification & Narrowly Scoped Loopback Self-Test Adapter**:
+   - The "Test My API" button in the frontend initiates verification against `http://127.0.0.1:4782/v1/chat/completions`.
+   - In environments where browser `window.fetch()` directly executes cross-origin requests, it does so cleanly.
+   - For packaged macOS WebViews running under custom URI schemes (`tauri://localhost`), WebKit security policies can restrict direct cross-scheme fetch calls to loopback HTTP. To guarantee 100% test fidelity without bypassing authentication or routing, `mlue` provides a narrowly scoped Tauri IPC command `verify_http_api_call`.
+   - This adapter makes a genuine HTTP request via `reqwest` to the loopback gateway with real Bearer headers, exercising the exact same Axum routing, API key SHA-256 verification, model access control, and SSE chunk parsers.
+   - It strictly rejects non-loopback URLs and does NOT call internal inference engine IPCs directly.
+2. **Idempotent Setup Without Auto-Duplication**:
+   - The onboarding component does NOT perform automatic entity creation in `useEffect` or mount handlers.
+   - If no project exists, the user is presented with a single explicit creation action. Subsequent reloads detect existing projects and bind to the active selection without duplicate database records.
+3. **Secret Hygiene**:
+   - Full plaintext keys (`mlue_sk_...`) exist only in transient React component state for testing and copying.
+   - Plaintext keys are never written to SQLite, localStorage, or IPC logs.
+4. **Live Latency & Token Diagnostics**:
+   - Time-To-First-Token (TTFT) and total request duration are measured using high-precision performance timers (`performance.now()`).
+   - Token metrics (`prompt_tokens`, `completion_tokens`, `total_tokens`) are parsed from streaming usage chunks and displayed in real time.
+5. **Copy-Ready Developer Integration Examples**:
+   - Generates fully populated, working snippets for Python (using official `openai` SDK v1.x with streaming and sync modes) and cURL (streaming SSE and sync JSON) with dynamic endpoints and key references.
+
 
 
 

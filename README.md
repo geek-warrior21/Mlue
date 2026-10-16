@@ -72,6 +72,15 @@ mlue is a local-first desktop application that allows users to expose supported 
 - **Host & Origin Validation**: Rejects untrusted Host headers (HTTP 400 `invalid_host`) and untrusted browser Origin headers (HTTP 403 `untrusted_origin`).
 - **Strict Parameter Rejection**: Rejects unimplemented parameters (`temperature`, `max_tokens`, `tools`, etc.) with HTTP 400 `unsupported_parameter`.
 
+### Brick 4A — First-Run Onboarding & One-Click API Verification
+- **Automated Local Model Discovery**: Auto-detects locally running Ollama models (e.g. `llama3.2:1b`) without manual network configuration.
+- **Streamlined 4-Step Quickstart**: Visual step-by-step progress cards (`Local Model -> Project -> Personal Key -> Live Test`) guiding first-time users.
+- **Idempotent Project & Key Setup**: Safe project selection/creation without accidental duplicate records on page reloads or app restart.
+- **One-Click Live API Verification**: "Test My API" button calling the actual embedded HTTP endpoint (`POST /v1/chat/completions`) using real HTTP `fetch` and SSE parsing, strictly avoiding IPC shortcuts.
+- **Comprehensive Live Metrics**: Real-time display of response text, HTTP status badge, Time-to-First-Token (TTFT), total generation duration (latency), selected model name, and token usage breakdown.
+- **Developer Integration Code Examples**: Copy-ready snippets for Python (Streaming with OpenAI SDK), Python (Sync), cURL (Streaming SSE), and cURL (Sync JSON), configured with the active local base URL and personal API key.
+- **Robust Failure Diagnostics**: Clear, actionable error cards diagnosing offline Ollama instances (HTTP 502), invalid or revoked keys (HTTP 401), concurrent capacity limits (HTTP 429), or missing models (HTTP 404).
+
 ---
 
 ## Prerequisites

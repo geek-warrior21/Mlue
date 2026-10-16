@@ -119,6 +119,196 @@ async fn revoke_api_key(
     keys.revoke_key(&key_id).await.map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VerifyHttpApiRequest {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    pub prompt: String,
+    pub stream: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VerifyHttpApiResponse {
+    pub success: bool,
+    pub http_status: u16,
+    pub model_used: Option<String>,
+    pub content: String,
+    pub duration_ms: u64,
+    pub time_to_first_token_ms: Option<u64>,
+    pub usage: Option<crate::inference::UsageInfo>,
+    pub error: Option<VerifyHttpApiError>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VerifyHttpApiError {
+    pub code: String,
+    pub message: String,
+    pub http_status: u16,
+}
+
+/// Narrowly scoped self-test adapter: executes a real HTTP request across loopback
+/// to verify the live embedded gateway (/v1/chat/completions) without bypassing
+/// Bearer authentication, model authorization, or inference routing.
+#[tauri::command(rename_all = "snake_case")]
+async fn verify_http_api_call(
+    request: VerifyHttpApiRequest,
+) -> Result<VerifyHttpApiResponse, String> {
+    let clean_endpoint = request.endpoint.trim().trim_end_matches('/');
+    // Security check: ensure endpoint is strictly loopback
+    if !clean_endpoint.starts_with("http://127.0.0.1:")
+        && !clean_endpoint.starts_with("http://localhost:")
+    {
+        return Err(
+            "Self-test adapter only permits loopback endpoints (127.0.0.1 / localhost)".to_string(),
+        );
+    }
+
+    let url = format!("{}/v1/chat/completions", clean_endpoint);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let payload = serde_json::json!({
+        "model": request.model,
+        "messages": [{ "role": "user", "content": request.prompt }],
+        "stream": request.stream,
+        "stream_options": if request.stream { serde_json::json!({ "include_usage": true }) } else { serde_json::Value::Null },
+    });
+
+    let start_time = std::time::Instant::now();
+    let res = client
+        .post(&url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", request.api_key),
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    let status = res.status().as_u16();
+
+    if !res.status().is_success() {
+        let err_json: serde_json::Value = res.json().await.unwrap_or_default();
+        let err_obj = &err_json["error"];
+        let code = err_obj["code"].as_str().unwrap_or("HTTP_ERROR").to_string();
+        let message = err_obj["message"]
+            .as_str()
+            .unwrap_or("Request failed")
+            .to_string();
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+
+        return Ok(VerifyHttpApiResponse {
+            success: false,
+            http_status: status,
+            model_used: None,
+            content: String::new(),
+            duration_ms,
+            time_to_first_token_ms: None,
+            usage: None,
+            error: Some(VerifyHttpApiError {
+                code,
+                message,
+                http_status: status,
+            }),
+        });
+    }
+
+    if !request.stream {
+        let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        let duration_ms = start_time.elapsed().as_millis() as u64;
+        let model_used = body["model"].as_str().map(|s| s.to_string());
+        let content = body["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let usage = if body["usage"].is_object() {
+            serde_json::from_value::<crate::inference::UsageInfo>(body["usage"].clone()).ok()
+        } else {
+            None
+        };
+
+        return Ok(VerifyHttpApiResponse {
+            success: true,
+            http_status: 200,
+            model_used,
+            content,
+            duration_ms,
+            time_to_first_token_ms: Some(duration_ms),
+            usage,
+            error: None,
+        });
+    }
+
+    // Streaming mode
+    use futures_util::StreamExt;
+    let mut stream = res.bytes_stream();
+    let mut time_to_first_token_ms: Option<u64> = None;
+    let mut accumulated_content = String::new();
+    let mut resolved_model: Option<String> = None;
+    let mut parsed_usage: Option<crate::inference::UsageInfo> = None;
+    let mut buffer = String::new();
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| e.to_string())?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        let mut lines: Vec<String> = buffer.split('\n').map(|s| s.to_string()).collect();
+        buffer = lines.pop().unwrap_or_default();
+
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(data_str) = line.strip_prefix("data:") {
+                let data_str = data_str.trim();
+                if data_str == "[DONE]" {
+                    continue;
+                }
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                    if resolved_model.is_none() {
+                        resolved_model = json["model"].as_str().map(|s| s.to_string());
+                    }
+                    if let Some(content_piece) = json
+                        .pointer("/choices/0/delta/content")
+                        .and_then(|c| c.as_str())
+                        && !content_piece.is_empty()
+                    {
+                        if time_to_first_token_ms.is_none() {
+                            time_to_first_token_ms = Some(start_time.elapsed().as_millis() as u64);
+                        }
+                        accumulated_content.push_str(content_piece);
+                    }
+                    if json["usage"].is_object() {
+                        parsed_usage = serde_json::from_value::<crate::inference::UsageInfo>(
+                            json["usage"].clone(),
+                        )
+                        .ok();
+                    }
+                }
+            }
+        }
+    }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+
+    Ok(VerifyHttpApiResponse {
+        success: true,
+        http_status: 200,
+        model_used: resolved_model,
+        content: accumulated_content,
+        duration_ms,
+        time_to_first_token_ms: time_to_first_token_ms.or(Some(duration_ms)),
+        usage: parsed_usage,
+        error: None,
+    })
+}
+
 #[tauri::command]
 async fn generate_test_completion(
     registry: State<'_, Arc<ModelRegistry>>,
@@ -339,7 +529,8 @@ pub fn run() {
             delete_project,
             create_api_key,
             list_api_keys,
-            revoke_api_key
+            revoke_api_key,
+            verify_http_api_call
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

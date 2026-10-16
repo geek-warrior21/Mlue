@@ -111,6 +111,107 @@ export interface CreatedApiKey {
   full_key: string;
 }
 
+export interface ApiTestResult {
+  status: "idle" | "running" | "success" | "error";
+  httpStatus: number | null;
+  modelUsed: string | null;
+  content: string;
+  durationMs: number | null;
+  timeToFirstTokenMs: number | null;
+  usage: UsageInfo | null;
+  error: {
+    code: string;
+    message: string;
+    httpStatus?: number | null;
+  } | null;
+}
+
+export type CodeSnippetTab = "python_stream" | "python_sync" | "curl_stream" | "curl_sync";
+
+function getIntegrationSnippet(
+  tab: CodeSnippetTab,
+  endpoint: string,
+  key: string,
+  modelId: string
+): string {
+  const model = modelId ? modelId.replace(/^ollama\//, "") : "auto";
+  const displayKey = key.trim() || "${MLUE_API_KEY}";
+  const baseUrl = `${endpoint}/v1`;
+
+  switch (tab) {
+    case "python_stream":
+      return `import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="${baseUrl}",
+    api_key=os.environ.get("MLUE_API_KEY", "${displayKey}"),
+)
+
+stream = client.chat.completions.create(
+    model="${model}",
+    messages=[
+        {"role": "user", "content": "Explain why local AI gives users data sovereignty in one sentence."}
+    ],
+    stream=True,
+    stream_options={"include_usage": True},
+)
+
+for chunk in stream:
+    if chunk.choices and chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+    if chunk.usage:
+        print(f"\\n[Usage: {chunk.usage.total_tokens} tokens]")
+print()`;
+
+    case "python_sync":
+      return `import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="${baseUrl}",
+    api_key=os.environ.get("MLUE_API_KEY", "${displayKey}"),
+)
+
+response = client.chat.completions.create(
+    model="${model}",
+    messages=[
+        {"role": "user", "content": "Explain why local AI gives users data sovereignty in one sentence."}
+    ],
+    stream=False,
+)
+
+print(response.choices[0].message.content)
+if response.usage:
+    print(f"[Tokens used: {response.usage.total_tokens}]")`;
+
+    case "curl_stream":
+      return `curl -N -X POST ${baseUrl}/chat/completions \\
+  -H "Authorization: Bearer ${displayKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${model}",
+    "messages": [
+      { "role": "user", "content": "Explain why local AI gives users data sovereignty in one sentence." }
+    ],
+    "stream": true,
+    "stream_options": { "include_usage": true }
+  }'`;
+
+    case "curl_sync":
+      return `curl -X POST ${baseUrl}/chat/completions \\
+  -H "Authorization: Bearer ${displayKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${model}",
+    "messages": [
+      { "role": "user", "content": "Explain why local AI gives users data sovereignty in one sentence." }
+    ],
+    "stream": false
+  }'`;
+  }
+}
+
 function formatBytes(bytes: number | null): string | null {
   if (bytes == null || bytes === 0) return null;
   const k = 1024;
@@ -175,6 +276,17 @@ export default function App() {
   const [selectedPolicyModels, setSelectedPolicyModels] = useState<string[]>([]);
   const [createdKeyData, setCreatedKeyData] = useState<CreatedApiKey | null>(null);
   const [revokingKeyId, setRevokingKeyId] = useState<string | null>(null);
+
+  // First-Run Onboarding & One-Click API Verification State (Brick 4A)
+  const [showOnboarding, setShowOnboarding] = useState<boolean>(true);
+  const [activeTestApiKey, setActiveTestApiKey] = useState<string>("");
+  const [apiTestPrompt, setApiTestPrompt] = useState<string>(
+    "Explain why local AI gives users data sovereignty in two sentences."
+  );
+  const [apiTestStreaming, setApiTestStreaming] = useState<boolean>(true);
+  const [isTestingApi, setIsTestingApi] = useState<boolean>(false);
+  const [apiTestResult, setApiTestResult] = useState<ApiTestResult | null>(null);
+  const [codeSnippetTab, setCodeSnippetTab] = useState<CodeSnippetTab>("python_stream");
 
   const selectedProject = projects.find((p) => p.id === selectedProjectId) || null;
 
@@ -494,6 +606,7 @@ export default function App() {
         });
         setApiKeys((prev) => [result.metadata, ...prev]);
         setCreatedKeyData(result);
+        setActiveTestApiKey(result.full_key);
       } else {
         const mockCreated: CreatedApiKey = {
           metadata: {
@@ -511,6 +624,7 @@ export default function App() {
         };
         setApiKeys((prev) => [mockCreated.metadata, ...prev]);
         setCreatedKeyData(mockCreated);
+        setActiveTestApiKey(mockCreated.full_key);
       }
       setNewKeyName("");
       setNewKeyPolicyType("local_only");
@@ -551,6 +665,249 @@ export default function App() {
     navigator.clipboard.writeText(text);
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
+  };
+
+  // One-Click HTTP API Test Runner (Brick 4A)
+  // Calls the actual embedded HTTP API endpoint (POST /v1/chat/completions), NOT an internal Tauri IPC shortcut!
+  const handleTestApi = async () => {
+    const keyToUse = activeTestApiKey.trim() || createdKeyData?.full_key;
+    if (!keyToUse) {
+      setApiTestResult({
+        status: "error",
+        httpStatus: 401,
+        modelUsed: null,
+        content: "",
+        durationMs: null,
+        timeToFirstTokenMs: null,
+        usage: null,
+        error: {
+          code: "missing_api_key",
+          message: "No API key provided. Generate a key in Step 2 or enter one into the API Key input.",
+          httpStatus: 401,
+        },
+      });
+      return;
+    }
+
+    setIsTestingApi(true);
+    setApiTestResult({
+      status: "running",
+      httpStatus: null,
+      modelUsed: null,
+      content: "",
+      durationMs: null,
+      timeToFirstTokenMs: null,
+      usage: null,
+      error: null,
+    });
+
+    const startTime = performance.now();
+    let timeToFirstToken: number | null = null;
+    let accumulatedContent = "";
+    const endpointUrl = runtimeStatus?.endpoint || "http://127.0.0.1:4782";
+
+    const targetModel = selectedModelId || "auto";
+    const userPrompt = apiTestPrompt.trim() || "Explain why local AI gives users data sovereignty in two sentences.";
+
+    try {
+
+      const res = await fetch(`${endpointUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${keyToUse}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: targetModel,
+          messages: [{ role: "user", content: userPrompt }],
+          stream: apiTestStreaming,
+          ...(apiTestStreaming ? { stream_options: { include_usage: true } } : {}),
+        }),
+      });
+
+      if (!res.ok) {
+        let errJson: any = null;
+        try {
+          errJson = await res.json();
+        } catch {
+          errJson = null;
+        }
+        const errObj = errJson?.error || {};
+        setApiTestResult({
+          status: "error",
+          httpStatus: res.status,
+          modelUsed: null,
+          content: "",
+          durationMs: Math.round(performance.now() - startTime),
+          timeToFirstTokenMs: null,
+          usage: null,
+          error: {
+            code: errObj.code || `HTTP_${res.status}`,
+            message: errObj.message || `Request failed with HTTP ${res.status} ${res.statusText}`,
+            httpStatus: res.status,
+          },
+        });
+        setIsTestingApi(false);
+        return;
+      }
+
+      if (!apiTestStreaming) {
+        const data = await res.json();
+        const durationMs = Math.round(performance.now() - startTime);
+        setApiTestResult({
+          status: "success",
+          httpStatus: 200,
+          modelUsed: data.model || targetModel,
+          content: data.choices?.[0]?.message?.content || "",
+          durationMs,
+          timeToFirstTokenMs: durationMs,
+          usage: data.usage || null,
+          error: null,
+        });
+        setIsTestingApi(false);
+        return;
+      }
+
+      // Streaming SSE
+      if (!res.body) {
+        throw new Error("Response body is not readable");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let resolvedModel = targetModel;
+      let usageData: UsageInfo | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        if (timeToFirstToken === null) {
+          timeToFirstToken = Math.round(performance.now() - startTime);
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data: ")) continue;
+          const payload = trimmed.slice(6);
+          if (payload === "[DONE]") continue;
+
+          try {
+            const chunk = JSON.parse(payload);
+            if (chunk.model) resolvedModel = chunk.model;
+            const delta = chunk.choices?.[0]?.delta?.content;
+            if (delta) {
+              accumulatedContent += delta;
+              setApiTestResult({
+                status: "running",
+                httpStatus: 200,
+                modelUsed: resolvedModel,
+                content: accumulatedContent,
+                durationMs: Math.round(performance.now() - startTime),
+                timeToFirstTokenMs: timeToFirstToken,
+                usage: usageData,
+                error: null,
+              });
+            }
+            if (chunk.usage) {
+              usageData = chunk.usage;
+            }
+          } catch {
+            // Ignore incomplete chunks
+          }
+        }
+      }
+
+      const totalDuration = Math.round(performance.now() - startTime);
+      setApiTestResult({
+        status: "success",
+        httpStatus: 200,
+        modelUsed: resolvedModel,
+        content: accumulatedContent,
+        durationMs: totalDuration,
+        timeToFirstTokenMs: timeToFirstToken,
+        usage: usageData,
+        error: null,
+      });
+    } catch (err: any) {
+      // If browser fetch failed (e.g. cross-scheme or mixed-content restriction in packaged WKWebView),
+      // seamlessly execute via the Tauri IPC self-test adapter which makes the real authenticated HTTP request across loopback
+      if (isTauri()) {
+        try {
+          const ipcRes = await invoke<{
+            success: boolean;
+            http_status: number;
+            model_used: string | null;
+            content: string;
+            duration_ms: number;
+            time_to_first_token_ms: number | null;
+            usage: UsageInfo | null;
+            error: { code: string; message: string; http_status: number } | null;
+          }>("verify_http_api_call", {
+            request: {
+              endpoint: endpointUrl,
+              api_key: keyToUse,
+              model: targetModel,
+              prompt: userPrompt,
+              stream: apiTestStreaming,
+            },
+          });
+
+          if (ipcRes.success) {
+            setApiTestResult({
+              status: "success",
+              httpStatus: ipcRes.http_status,
+              modelUsed: ipcRes.model_used || targetModel,
+              content: ipcRes.content,
+              durationMs: ipcRes.duration_ms,
+              timeToFirstTokenMs: ipcRes.time_to_first_token_ms,
+              usage: ipcRes.usage,
+              error: null,
+            });
+            return;
+          } else if (ipcRes.error) {
+            setApiTestResult({
+              status: "error",
+              httpStatus: ipcRes.http_status,
+              modelUsed: null,
+              content: "",
+              durationMs: ipcRes.duration_ms,
+              timeToFirstTokenMs: null,
+              usage: null,
+              error: {
+                code: ipcRes.error.code,
+                message: ipcRes.error.message,
+                httpStatus: ipcRes.error.http_status,
+              },
+            });
+            return;
+          }
+        } catch {
+          // Fall through to generic network error below
+        }
+      }
+
+      setApiTestResult({
+        status: "error",
+        httpStatus: null,
+        modelUsed: null,
+        content: accumulatedContent,
+        durationMs: Math.round(performance.now() - startTime),
+        timeToFirstTokenMs: null,
+        usage: null,
+        error: {
+          code: "NETWORK_ERROR",
+          message: err?.message || "Failed to connect to local mlue HTTP server. Ensure mlue is running on 127.0.0.1:4782.",
+        },
+      });
+    } finally {
+      setIsTestingApi(false);
+    }
   };
 
   // Cancel active inference operation
@@ -768,6 +1125,7 @@ export default function App() {
   const badge = getStatusBadge();
   const providerStatus = discoveryData?.status || "checking";
   const hasAvailableModels = Boolean(discoveryData?.models && discoveryData.models.length > 0);
+  const models = discoveryData?.models || [];
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-sans flex flex-col items-center justify-center p-6 selection:bg-indigo-500/30 selection:text-indigo-200">
@@ -808,6 +1166,613 @@ export default function App() {
             <p className="text-xs text-rose-300/80 break-words font-mono mt-0.5">{runtimeStatus.error}</p>
           </div>
         )}
+
+        {/* ========================================================================= */}
+        {/* BRICK 4A: FIRST-RUN ONBOARDING & ONE-CLICK API VERIFICATION               */}
+        {/* ========================================================================= */}
+        <section
+          id="onboarding-section"
+          className="rounded-2xl border border-indigo-500/30 bg-gradient-to-b from-indigo-950/20 via-zinc-900/60 to-zinc-950/80 p-5 shadow-xl shadow-indigo-950/20 space-y-6"
+        >
+          {/* Header & Toggle */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-zinc-800/80">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                  Quickstart Guide
+                </span>
+                <span className="text-xs text-zinc-400">Brick 4A</span>
+              </div>
+              <h2 className="text-lg font-bold text-white mt-1 tracking-tight">
+                First-Run Onboarding & One-Click API Verification
+              </h2>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Connect your local model, configure a project, create an API key, and verify real HTTP inference in seconds.
+              </p>
+            </div>
+            <button
+              id="toggle-onboarding-btn"
+              onClick={() => setShowOnboarding(!showOnboarding)}
+              className="self-start sm:self-auto px-3 py-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700/80 text-zinc-300 text-xs font-medium cursor-pointer transition-colors flex items-center gap-1.5"
+            >
+              <span>{showOnboarding ? "Collapse Quickstart" : "Expand Quickstart"}</span>
+              <svg
+                className={`w-3.5 h-3.5 transition-transform duration-200 ${showOnboarding ? "rotate-180" : ""}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+          </div>
+
+          {showOnboarding && (
+            <div className="space-y-6">
+              {/* Step Flow Overview (1 -> 2 -> 3 -> 4) */}
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+                {/* Step 1: Discovered Model */}
+                <div
+                  id="onboarding-step-1-card"
+                  className={`p-3.5 rounded-xl border transition-colors ${
+                    models.length > 0
+                      ? "bg-emerald-950/20 border-emerald-500/40 text-emerald-200"
+                      : "bg-zinc-900/60 border-zinc-800 text-zinc-400"
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold mb-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center justify-center text-[10px] font-bold">1</span>
+                      Local Model
+                    </span>
+                    {models.length > 0 ? (
+                      <span className="text-[10px] text-emerald-400 font-medium">Ready</span>
+                    ) : (
+                      <span className="text-[10px] text-amber-400 font-medium">Checking...</span>
+                    )}
+                  </div>
+                  <div className="font-mono text-[11px] truncate text-white" id="onboarding-model-name">
+                    {models.length > 0 ? selectedModelId || models[0].id : "No local model found"}
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-1">
+                    {models.length > 0 ? `Detected ${models.length} model(s) via Ollama` : "Start Ollama on 127.0.0.1:11434"}
+                  </div>
+                </div>
+
+                {/* Step 2: Project Selection / Creation */}
+                <div
+                  id="onboarding-step-2-card"
+                  className={`p-3.5 rounded-xl border transition-colors ${
+                    selectedProjectId
+                      ? "bg-emerald-950/20 border-emerald-500/40 text-emerald-200"
+                      : "bg-zinc-900/60 border-zinc-800 text-zinc-400"
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold mb-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center justify-center text-[10px] font-bold">2</span>
+                      Project
+                    </span>
+                    {selectedProjectId ? (
+                      <span className="text-[10px] text-emerald-400 font-medium">Selected</span>
+                    ) : (
+                      <span className="text-[10px] text-amber-400 font-medium">Required</span>
+                    )}
+                  </div>
+                  <div className="font-medium text-[11px] truncate text-white" id="onboarding-project-name">
+                    {projects.find((p) => p.id === selectedProjectId)?.name || (projects.length > 0 ? projects[0].name : "Create first project")}
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-1">
+                    {projects.length > 0 ? `${projects.length} project(s) available` : "Click below to initialize"}
+                  </div>
+                </div>
+
+                {/* Step 3: API Key */}
+                <div
+                  id="onboarding-step-3-card"
+                  className={`p-3.5 rounded-xl border transition-colors ${
+                    activeTestApiKey || createdKeyData
+                      ? "bg-emerald-950/20 border-emerald-500/40 text-emerald-200"
+                      : "bg-zinc-900/60 border-zinc-800 text-zinc-400"
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold mb-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center justify-center text-[10px] font-bold">3</span>
+                      Personal Key
+                    </span>
+                    {activeTestApiKey || createdKeyData ? (
+                      <span className="text-[10px] text-emerald-400 font-medium">Armed</span>
+                    ) : (
+                      <span className="text-[10px] text-zinc-400 font-medium">Pending</span>
+                    )}
+                  </div>
+                  <div className="font-mono text-[11px] truncate text-white" id="onboarding-key-status">
+                    {activeTestApiKey ? `${activeTestApiKey.slice(0, 14)}...` : (createdKeyData ? `${createdKeyData.full_key.slice(0, 14)}...` : "Generate a key")}
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-1">
+                    One-time viewable secret key
+                  </div>
+                </div>
+
+                {/* Step 4: Live Verification */}
+                <div
+                  id="onboarding-step-4-card"
+                  className={`p-3.5 rounded-xl border transition-colors ${
+                    apiTestResult?.status === "success"
+                      ? "bg-emerald-950/30 border-emerald-500/50 text-emerald-200"
+                      : apiTestResult?.status === "error"
+                      ? "bg-rose-950/30 border-rose-500/50 text-rose-200"
+                      : isTestingApi
+                      ? "bg-indigo-950/30 border-indigo-500/50 text-indigo-200 animate-pulse"
+                      : "bg-zinc-900/60 border-zinc-800 text-zinc-400"
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold mb-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-300 flex items-center justify-center text-[10px] font-bold">4</span>
+                      Live Test
+                    </span>
+                    <span className="text-[10px] font-medium">
+                      {apiTestResult?.status === "success"
+                        ? "Verified"
+                        : apiTestResult?.status === "error"
+                        ? "Failed"
+                        : isTestingApi
+                        ? "Running"
+                        : "Ready"}
+                    </span>
+                  </div>
+                  <div className="font-semibold text-[11px] text-white">
+                    HTTP /v1/chat/completions
+                  </div>
+                  <div className="text-[10px] text-zinc-400 mt-1">
+                    {apiTestResult?.durationMs ? `Latency: ${apiTestResult.durationMs}ms` : "Real authenticated HTTP call"}
+                  </div>
+                </div>
+              </div>
+
+              {/* Quick Setup Actions if Project or Key missing */}
+              {(!selectedProjectId || (!activeTestApiKey && !createdKeyData)) && (
+                <div className="p-4 rounded-xl bg-zinc-900/80 border border-zinc-800 space-y-3">
+                  <div className="text-xs font-semibold text-zinc-200">
+                    Quick Setup Controls
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    {/* If no projects exist */}
+                    {projects.length === 0 ? (
+                      <button
+                        id="onboarding-create-initial-project-btn"
+                        onClick={async () => {
+                          try {
+                            const name = "Default";
+                            let proj: Project;
+                            if (isTauri()) {
+                              proj = await invoke<Project>("create_project", { name });
+                            } else {
+                              proj = {
+                                id: `proj_${Date.now()}`,
+                                name,
+                                description: null,
+                                created_at: new Date().toISOString(),
+                                updated_at: new Date().toISOString(),
+                              };
+                            }
+                            setProjects([proj]);
+                            setSelectedProjectId(proj.id);
+                          } catch (err) {
+                            setProjectError(err instanceof Error ? err.message : String(err));
+                          }
+                        }}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors"
+                      >
+                        + Create "Default" Project
+                      </button>
+                    ) : !selectedProjectId ? (
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-zinc-400">Select Project:</span>
+                        <select
+                          id="onboarding-select-project-dropdown"
+                          value={selectedProjectId || ""}
+                          onChange={(e) => setSelectedProjectId(e.target.value)}
+                          className="bg-zinc-950 border border-zinc-700 rounded-lg px-2 py-1 text-xs text-white"
+                        >
+                          <option value="" disabled>Choose a project...</option>
+                          {projects.map((p) => (
+                            <option key={p.id} value={p.id}>{p.name}</option>
+                          ))}
+                        </select>
+                      </div>
+                    ) : null}
+
+                    {/* Quick key generator if project exists but no active test key */}
+                    {selectedProjectId && !activeTestApiKey && !createdKeyData && (
+                      <button
+                        id="onboarding-quick-generate-key-btn"
+                        onClick={async () => {
+                          try {
+                            const keyName = "Onboarding Key";
+                            const policy: AccessPolicy = { type: "local_only" };
+                            let result: CreatedApiKey;
+                            if (isTauri()) {
+                              result = await invoke<CreatedApiKey>("create_api_key", {
+                                project_id: selectedProjectId,
+                                name: keyName,
+                                access_policy: policy,
+                              });
+                            } else {
+                              result = {
+                                metadata: {
+                                  id: `key_${Date.now()}`,
+                                  project_id: selectedProjectId,
+                                  name: keyName,
+                                  key_prefix: "mlue_sk_mock123...",
+                                  access_policy: policy,
+                                  enabled: true,
+                                  created_at: new Date().toISOString(),
+                                  last_used_at: null,
+                                  revoked_at: null,
+                                },
+                                full_key: "mlue_sk_mock_live_testing_key_1234567890abcdef1234567890",
+                              };
+                            }
+                            setApiKeys((prev) => [result.metadata, ...prev]);
+                            setCreatedKeyData(result);
+                            setActiveTestApiKey(result.full_key);
+                          } catch (err) {
+                            setKeyError(err instanceof Error ? err.message : String(err));
+                          }
+                        }}
+                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors"
+                      >
+                        🔑 Generate Test API Key
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* One-Click Verification Form & Playground */}
+              <div className="p-4 rounded-xl bg-zinc-950/70 border border-zinc-800/90 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-indigo-400" />
+                    <h3 className="text-sm font-semibold text-white">One-Click HTTP API Verification</h3>
+                  </div>
+                  <span className="text-[11px] text-zinc-400 font-mono">
+                    POST {runtimeStatus?.endpoint || "http://127.0.0.1:4782"}/v1/chat/completions
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {/* API Key Input */}
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider flex items-center justify-between">
+                      <span>API Key</span>
+                      {createdKeyData?.full_key && (
+                        <button
+                          onClick={() => setActiveTestApiKey(createdKeyData.full_key)}
+                          className="text-[10px] text-indigo-400 hover:underline cursor-pointer"
+                        >
+                          Use Newly Generated Key
+                        </button>
+                      )}
+                    </label>
+                    <input
+                      id="test-api-key-input"
+                      type="password"
+                      placeholder="mlue_sk_..."
+                      value={activeTestApiKey}
+                      onChange={(e) => setActiveTestApiKey(e.target.value)}
+                      className="w-full font-mono text-xs bg-zinc-900 border border-zinc-700/80 rounded-lg px-3 py-2 text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+
+                  {/* Target Model Selection */}
+                  <div className="space-y-1">
+                    <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
+                      Target Model
+                    </label>
+                    <select
+                      id="test-api-model-select"
+                      value={selectedModelId || ""}
+                      onChange={(e) => setSelectedModelId(e.target.value)}
+                      className="w-full text-xs bg-zinc-900 border border-zinc-700/80 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="">auto (First Available Local Model)</option>
+                      {models.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.display_name || m.id} ({m.provider_id})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Prompt Input */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
+                      Test Prompt
+                    </label>
+                    <div className="flex items-center gap-1.5 text-[10px]">
+                      <span className="text-zinc-500">Presets:</span>
+                      <button
+                        onClick={() => setApiTestPrompt("Explain why local AI gives users data sovereignty in two sentences.")}
+                        className="text-zinc-400 hover:text-indigo-300 underline cursor-pointer"
+                      >
+                        Sovereignty
+                      </button>
+                      <button
+                        onClick={() => setApiTestPrompt("Count from 1 to 5 with commas.")}
+                        className="text-zinc-400 hover:text-indigo-300 underline cursor-pointer"
+                      >
+                        Count
+                      </button>
+                      <button
+                        onClick={() => setApiTestPrompt("Write a two-line poem about code.")}
+                        className="text-zinc-400 hover:text-indigo-300 underline cursor-pointer"
+                      >
+                        Poem
+                      </button>
+                    </div>
+                  </div>
+                  <textarea
+                    id="test-api-prompt-input"
+                    rows={2}
+                    value={apiTestPrompt}
+                    onChange={(e) => setApiTestPrompt(e.target.value)}
+                    placeholder="Enter a test prompt for the model..."
+                    className="w-full text-xs bg-zinc-900 border border-zinc-700/80 rounded-lg p-2.5 text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-indigo-500 resize-none font-sans"
+                  />
+                </div>
+
+                {/* Controls: Streaming toggle & Test Button */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-1">
+                  <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                    <input
+                      id="test-streaming-toggle"
+                      type="checkbox"
+                      checked={apiTestStreaming}
+                      onChange={(e) => setApiTestStreaming(e.target.checked)}
+                      className="rounded bg-zinc-800 border-zinc-700 text-indigo-500 focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                    />
+                    <span>Stream Response via Server-Sent Events (SSE)</span>
+                  </label>
+
+                  <button
+                    id="test-my-api-btn"
+                    onClick={handleTestApi}
+                    disabled={isTestingApi || (!activeTestApiKey && !createdKeyData?.full_key)}
+                    className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-lg text-xs font-semibold cursor-pointer transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-indigo-900/30 flex items-center justify-center gap-2"
+                  >
+                    {isTestingApi ? (
+                      <>
+                        <svg className="w-3.5 h-3.5 animate-spin text-white" viewBox="0 0 24 24" fill="none">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                        </svg>
+                        <span>Testing Live HTTP API...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>⚡</span>
+                        <span>Test My API</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* API Test Results Card */}
+                {apiTestResult && (
+                  <div
+                    id="test-api-results-box"
+                    className={`mt-4 p-4 rounded-xl border space-y-3 transition-colors ${
+                      apiTestResult.status === "success"
+                        ? "bg-zinc-900/90 border-emerald-500/40"
+                        : apiTestResult.status === "error"
+                        ? "bg-rose-950/30 border-rose-500/50"
+                        : "bg-zinc-900/90 border-indigo-500/40"
+                    }`}
+                  >
+                    {/* Result Header & Metrics */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-zinc-800">
+                      <div className="flex items-center gap-2">
+                        <span
+                          id="test-api-status-badge"
+                          className={`px-2 py-0.5 rounded text-[11px] font-bold ${
+                            apiTestResult.status === "success"
+                              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
+                              : apiTestResult.status === "error"
+                              ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
+                              : "bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 animate-pulse"
+                          }`}
+                        >
+                          {apiTestResult.status === "success"
+                            ? "200 OK — Authenticated"
+                            : apiTestResult.status === "error"
+                            ? `HTTP ${apiTestResult.httpStatus || "Error"}`
+                            : "Streaming / Generating..."}
+                        </span>
+
+                        <span id="test-api-model-used" className="text-xs font-mono text-zinc-300">
+                          {apiTestResult.modelUsed || selectedModelId || "auto"}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-3 text-[11px] text-zinc-400 font-mono">
+                        {apiTestResult.timeToFirstTokenMs !== null && (
+                          <span title="Time To First Token">
+                            TTFT: <strong className="text-zinc-200">{apiTestResult.timeToFirstTokenMs}ms</strong>
+                          </span>
+                        )}
+                        {apiTestResult.durationMs !== null && (
+                          <span id="test-api-latency" title="Total Elapsed Duration">
+                            Total: <strong className="text-zinc-200">{apiTestResult.durationMs}ms</strong>
+                          </span>
+                        )}
+                        {apiTestResult.usage && (
+                          <span title="Prompt + Completion = Total Tokens" className="text-zinc-400">
+                            Tokens: <strong className="text-zinc-200">{apiTestResult.usage.total_tokens}</strong> ({apiTestResult.usage.prompt_tokens}+{apiTestResult.usage.completion_tokens})
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Error Display */}
+                    {apiTestResult.error && (
+                      <div id="test-api-error-alert" className="p-3 rounded-lg bg-rose-950/50 border border-rose-800/60 text-xs text-rose-200 space-y-1">
+                        <div className="font-semibold flex items-center gap-1.5 text-rose-300">
+                          <span>❌ Error: {apiTestResult.error.code}</span>
+                        </div>
+                        <p className="font-mono text-[11px] break-words text-rose-300/90">
+                          {apiTestResult.error.message}
+                        </p>
+                        {apiTestResult.error.httpStatus === 401 && (
+                          <p className="text-[10px] text-rose-300/70 mt-1">
+                            Tip: Confirm your API key was created and has not been revoked.
+                          </p>
+                        )}
+                        {apiTestResult.error.httpStatus === 502 && (
+                          <p className="text-[10px] text-rose-300/70 mt-1">
+                            Tip: Verify that Ollama is running locally on port 11434 and the model is downloaded.
+                          </p>
+                        )}
+                        {apiTestResult.error.httpStatus === 429 && (
+                          <p className="text-[10px] text-rose-300/70 mt-1">
+                            Tip: mlue throttles concurrent requests to preserve local machine resources. Please retry in a moment.
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Generated Response Content */}
+                    <div className="space-y-1">
+                      <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                        Generated Model Output
+                      </div>
+                      <div
+                        id="test-api-response-content"
+                        className="p-3 rounded-lg bg-black/40 border border-zinc-800/80 font-mono text-xs text-zinc-200 whitespace-pre-wrap leading-relaxed max-h-60 overflow-y-auto"
+                      >
+                        {apiTestResult.content ? (
+                          <>
+                            {apiTestResult.content}
+                            {isTestingApi && (
+                              <span className="inline-block w-1.5 h-3.5 bg-indigo-400 ml-0.5 animate-pulse align-middle" />
+                            )}
+                          </>
+                        ) : isTestingApi ? (
+                          <span className="text-zinc-500 italic">Waiting for first token...</span>
+                        ) : (
+                          <span className="text-zinc-500 italic">No output received.</span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Developer Integration Code Snippets (Python & cURL) */}
+              <div className="p-4 rounded-xl bg-zinc-950/70 border border-zinc-800/90 space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-semibold text-white uppercase tracking-wider">
+                      Developer Integration Code Examples
+                    </h3>
+                    <p className="text-[11px] text-zinc-400">
+                      Copy-ready code examples configured for your local mlue gateway. No external accounts or paid proxies needed.
+                    </p>
+                  </div>
+
+                  <button
+                    id="copy-snippet-btn"
+                    onClick={() => {
+                      const snippet = getIntegrationSnippet(
+                        codeSnippetTab,
+                        runtimeStatus?.endpoint || "http://127.0.0.1:4782",
+                        activeTestApiKey || createdKeyData?.full_key || "YOUR_MLUE_API_KEY",
+                        selectedModelId || "llama3.2:1b"
+                      );
+                      copyToClipboard(snippet, `snippet-${codeSnippetTab}`);
+                    }}
+                    className="self-start sm:self-auto px-3 py-1.5 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors flex items-center gap-1.5"
+                  >
+                    <span>📋</span>
+                    <span>
+                      {copiedKey === `snippet-${codeSnippetTab}` ? "Copied Snippet!" : "Copy Snippet"}
+                    </span>
+                  </button>
+                </div>
+
+                {/* Tabs */}
+                <div className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800 pb-2">
+                  <button
+                    id="snippet-tab-python-stream"
+                    onClick={() => setCodeSnippetTab("python_stream")}
+                    className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
+                      codeSnippetTab === "python_stream"
+                        ? "bg-indigo-600/30 text-indigo-300 border border-indigo-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    Python (Streaming)
+                  </button>
+                  <button
+                    id="snippet-tab-python-sync"
+                    onClick={() => setCodeSnippetTab("python_sync")}
+                    className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
+                      codeSnippetTab === "python_sync"
+                        ? "bg-indigo-600/30 text-indigo-300 border border-indigo-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    Python (Sync)
+                  </button>
+                  <button
+                    id="snippet-tab-curl-stream"
+                    onClick={() => setCodeSnippetTab("curl_stream")}
+                    className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
+                      codeSnippetTab === "curl_stream"
+                        ? "bg-indigo-600/30 text-indigo-300 border border-indigo-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    cURL (Streaming SSE)
+                  </button>
+                  <button
+                    id="snippet-tab-curl-sync"
+                    onClick={() => setCodeSnippetTab("curl_sync")}
+                    className={`px-2.5 py-1 rounded text-xs font-medium cursor-pointer transition-colors ${
+                      codeSnippetTab === "curl_sync"
+                        ? "bg-indigo-600/30 text-indigo-300 border border-indigo-500/40"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    cURL (Sync JSON)
+                  </button>
+                </div>
+
+                {/* Snippet Preview */}
+                <div className="relative">
+                  <pre
+                    id="code-snippet-preview"
+                    className="p-3.5 rounded-lg bg-black/60 border border-zinc-800/90 font-mono text-[11px] text-zinc-300 overflow-x-auto select-all leading-relaxed"
+                  >
+                    <code>
+                      {getIntegrationSnippet(
+                        codeSnippetTab,
+                        runtimeStatus?.endpoint || "http://127.0.0.1:4782",
+                        activeTestApiKey || createdKeyData?.full_key || "YOUR_MLUE_API_KEY",
+                        selectedModelId || "llama3.2:1b"
+                      )}
+                    </code>
+                  </pre>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
 
         {/* SECTION 1: Embedded Runtime & Local API */}
         <div className="space-y-3">
@@ -986,15 +1951,29 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Quick Integration / Python Example Button */}
+              {/* Quick Integration / Python Example Button & Test Key Button */}
               <div className="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-t border-emerald-900/40">
                 <span className="text-[11px] text-zinc-400">
                   mlue must be running locally for requests to succeed.
                 </span>
-                <button
-                  id="copy-python-example-btn"
-                  onClick={() => {
-                    const pythonSnippet = `from openai import OpenAI
+                <div className="flex items-center gap-2">
+                  <button
+                    id="test-this-new-key-btn"
+                    onClick={() => {
+                      setActiveTestApiKey(createdKeyData.full_key);
+                      setShowOnboarding(true);
+                      const el = document.getElementById("onboarding-section");
+                      if (el) el.scrollIntoView({ behavior: "smooth" });
+                    }}
+                    className="px-3 py-1.5 bg-emerald-600/90 hover:bg-emerald-600 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap flex items-center gap-1.5"
+                  >
+                    <span>⚡</span>
+                    <span>Test This Key</span>
+                  </button>
+                  <button
+                    id="copy-python-example-btn"
+                    onClick={() => {
+                      const pythonSnippet = `from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:4782/v1",
@@ -1009,17 +1988,18 @@ response = client.chat.completions.create(
 )
 
 print(response.choices[0].message.content)`;
-                    copyToClipboard(pythonSnippet, "python-example");
-                  }}
-                  className="px-3 py-1.5 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap flex items-center gap-1.5"
-                >
-                  <span>🐍</span>
-                  <span>{copiedKey === "python-example" ? "Copied Example!" : "Copy Python Example"}</span>
-                </button>
+                      copyToClipboard(pythonSnippet, "python-example");
+                    }}
+                    className="px-3 py-1.5 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded-lg text-xs font-medium cursor-pointer transition-colors whitespace-nowrap flex items-center gap-1.5"
+                  >
+                    <span>🐍</span>
+                    <span>{copiedKey === "python-example" ? "Copied Example!" : "Copy Python Example"}</span>
+                  </button>
+                </div>
               </div>
 
               <div className="p-2 rounded-lg bg-zinc-900/80 border border-zinc-800 text-[11px] text-zinc-400">
-                <span className="text-zinc-300 font-medium">Notice:</span> HTTP streaming (SSE) and remote network access are not yet available. Send requests with <code className="text-zinc-200 bg-zinc-800 px-1 py-0.5 rounded font-mono">stream: false</code>.
+                <span className="text-zinc-300 font-medium">Notice:</span> HTTP streaming (SSE) is fully supported! Remote network access is intentionally disabled to protect your local machine sovereignty.
               </div>
             </div>
           )}

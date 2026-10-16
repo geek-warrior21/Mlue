@@ -68,26 +68,74 @@ pub fn is_trusted_host(host: &str) -> bool {
 }
 
 /// Checks whether the Origin header represents a trusted local desktop / development origin.
+/// In production, only the exact packaged Tauri webview origins ('tauri://localhost', 'http://tauri.localhost') are trusted.
+/// In debug/development mode, the exact Vite dev server origins ('http://localhost:1420', 'http://127.0.0.1:1420') are additionally permitted.
+/// Arbitrary localhost browser origins (e.g. 'http://localhost:8080') are rejected in all environments.
 pub fn is_trusted_origin(origin: &str) -> bool {
     let origin_clean = origin.trim();
     if origin_clean.is_empty() {
         return false;
     }
 
-    // Exact matches for known Tauri schemes
+    // Exact matches for known Tauri packaged schemes (all environments)
     if origin_clean == "tauri://localhost" || origin_clean == "http://tauri.localhost" {
         return true;
     }
 
-    // Check HTTP loopback origins (e.g. http://localhost:1420, http://127.0.0.1:1420, http://localhost:4782, etc.)
-    if let Some(stripped) = origin_clean.strip_prefix("http://") {
-        let host_part = if let Some(slash_pos) = stripped.find('/') {
-            &stripped[..slash_pos]
-        } else {
-            stripped
-        };
-        is_trusted_host(host_part)
-    } else {
-        false
+    // In development mode only, permit exact Vite development server origins
+    #[cfg(debug_assertions)]
+    {
+        if origin_clean == "http://localhost:1420" || origin_clean == "http://127.0.0.1:1420" {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_trusted_host() {
+        assert!(is_trusted_host("127.0.0.1"));
+        assert!(is_trusted_host("127.0.0.1:4782"));
+        assert!(is_trusted_host("localhost"));
+        assert!(is_trusted_host("localhost:4782"));
+        assert!(is_trusted_host("LOCALHOST:8080"));
+        assert!(is_trusted_host("[::1]"));
+        assert!(is_trusted_host("[::1]:4782"));
+
+        assert!(!is_trusted_host(""));
+        assert!(!is_trusted_host("   "));
+        assert!(!is_trusted_host("evil.com"));
+        assert!(!is_trusted_host("attacker.com:4782"));
+        assert!(!is_trusted_host("192.168.1.100"));
+        assert!(!is_trusted_host("0.0.0.0"));
+    }
+
+    #[test]
+    fn test_is_trusted_origin_packaged_tauri() {
+        assert!(is_trusted_origin("tauri://localhost"));
+        assert!(is_trusted_origin("http://tauri.localhost"));
+    }
+
+    #[test]
+    fn test_is_trusted_origin_rejects_arbitrary_and_malicious() {
+        assert!(!is_trusted_origin(""));
+        assert!(!is_trusted_origin("http://evil.com"));
+        assert!(!is_trusted_origin("https://malicious.org"));
+        assert!(!is_trusted_origin("http://localhost:8080"));
+        assert!(!is_trusted_origin("http://localhost:3000"));
+        assert!(!is_trusted_origin("http://127.0.0.1:8000"));
+        assert!(!is_trusted_origin("http://tauri.localhost.evil.com"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_is_trusted_origin_dev_mode() {
+        assert!(is_trusted_origin("http://localhost:1420"));
+        assert!(is_trusted_origin("http://127.0.0.1:1420"));
     }
 }

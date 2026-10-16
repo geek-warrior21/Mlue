@@ -10,7 +10,7 @@ mlue exposes a local-first, OpenAI-compatible HTTP interface powered by an embed
 - **Health Check**: `http://127.0.0.1:4782/health`
 - **Loopback Exclusivity**: The embedded server binds strictly to IPv4 loopback (`127.0.0.1:4782`). It does not bind to `0.0.0.0` or expose open network surfaces to external networks or the internet.
 - **Host Header Validation**: Requests must present a loopback host header (`127.0.0.1`, `localhost`, or `127.0.0.1:4782`). Untrusted hosts are rejected with HTTP 400 `invalid_host`.
-- **Origin Header Validation**: Browser cross-origin requests are validated. Requests from untrusted origins are rejected with HTTP 403 `untrusted_origin`. Only local development and desktop application origins (`http://localhost:*`, `http://127.0.0.1:*`, `tauri://localhost`, `http://tauri.localhost`) or standard non-browser CLI clients (which omit `Origin`) are accepted. Wildcard CORS (`*`) is prohibited.
+- **Origin Header Validation**: Browser cross-origin requests are validated. Requests from untrusted origins are rejected with HTTP 403 `untrusted_origin`. In production, only exact packaged desktop application origins (`tauri://localhost`, `http://tauri.localhost`) are accepted. In development mode, exact Vite dev server origins (`http://localhost:1420`, `http://127.0.0.1:1420`) are additionally permitted. Arbitrary localhost browser origins (e.g. `http://localhost:8080`) are strictly rejected. Standard non-browser CLI clients (cURL, Python SDK, which omit `Origin`) are accepted. Wildcard CORS (`*`) is strictly prohibited.
 
 ---
 
@@ -365,3 +365,37 @@ for chunk in stream:
         print(f"\n[Usage: {chunk.usage.total_tokens} tokens]")
 print()
 ```
+
+---
+
+## 7. First-Run Onboarding & One-Click Verification Compatibility
+
+As of Brick 4A, mlue includes an interactive, browser-level API verification test runner built into the desktop interface.
+
+### 7.1 Web Origin & CORS Preflight Rules
+When testing through the desktop WebView or a local browser frontend:
+- **Preflight Request**: The browser dispatches an HTTP `OPTIONS /v1/chat/completions` request before the POST call.
+- **Allowed Headers**: `Authorization`, `Content-Type`.
+- **Allowed Methods**: `GET`, `POST`, `OPTIONS`.
+- **Permitted Origins**: Loopback WebViews (`http://localhost:1420`, `http://127.0.0.1:1420`, `tauri://localhost`, `http://tauri.localhost`).
+- **Forbidden Origins**: Any non-local or untrusted domain receives HTTP 403 `untrusted_origin`.
+
+### 7.2 Native Verification Call Pattern
+The one-click test button triggers an authentic HTTP POST using the Web API `fetch()`:
+```javascript
+const response = await fetch("http://127.0.0.1:4782/v1/chat/completions", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${activeApiKey}`,
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({
+    model: "auto",
+    messages: [{ role: "user", content: "Explain data sovereignty in two sentences." }],
+    stream: true,
+    stream_options: { include_usage: true }
+  })
+});
+```
+This tests the full production HTTP gateway stack identically to third-party SDK calls.
+
