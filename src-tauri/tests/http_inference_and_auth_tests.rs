@@ -94,6 +94,34 @@ async fn mock_chat_handler(
         .unwrap_or(false);
 
     if is_streaming {
+        if last_content.contains("Slow stream") {
+            let stream = futures_util::stream::unfold((0, false), |(step, finished)| async move {
+                if finished {
+                    None
+                } else if step == 0 {
+                    Some((
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(
+                            "{\"message\":{\"role\":\"assistant\",\"content\":\"Echo: \"},\"done\":false}\n",
+                        )),
+                        (1, false),
+                    ))
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Some((
+                        Ok::<_, std::io::Error>(bytes::Bytes::from(
+                            "{\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":12,\"eval_count\":6}\n",
+                        )),
+                        (2, true),
+                    ))
+                }
+            });
+            return axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header("Content-Type", "application/x-ndjson")
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap();
+        }
+
         let chunks = vec![
             Ok::<_, std::io::Error>(bytes::Bytes::from(
                 "{\"message\":{\"role\":\"assistant\",\"content\":\"Echo: \"},\"done\":false}\n",
@@ -1711,4 +1739,289 @@ async fn test_38_brick4a_untrusted_host_header_rejected() {
         let body: Value = res.json().await.unwrap();
         assert_eq!(body["error"]["code"], "invalid_host");
     }
+}
+
+// 39. Self-test IPC destination restrictions enforce scheme, loopback, exact port, no userinfo, allowed route, no query/fragment
+#[tokio::test]
+async fn test_39_self_test_ipc_destination_restrictions() {
+    use mlue_lib::{VerifyHttpApiRequest, execute_verify_http_api_call};
+    let expected_port = 4782;
+
+    // Bad scheme
+    let req = VerifyHttpApiRequest {
+        endpoint: "https://127.0.0.1:4782".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Self-test adapter only permits 'http://'"));
+
+    // Userinfo (credentials)
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://admin:secret@127.0.0.1:4782".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("forbids userinfo credentials"));
+
+    // Remote host / LAN
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://192.168.1.100:4782".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Self-test adapter strictly requires loopback"));
+
+    // Non-mlue port (e.g. 11434, 8080)
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://127.0.0.1:11434".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Self-test adapter only permits exact mlue service port"));
+
+    // Query parameters
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://127.0.0.1:4782?key=value".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Self-test adapter forbids query parameters"));
+
+    // URL Fragment
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://127.0.0.1:4782#section".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Self-test adapter forbids URL fragments"));
+
+    // Arbitrary unallowed route / path
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://127.0.0.1:4782/admin".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+    let err = execute_verify_http_api_call(req, expected_port)
+        .await
+        .unwrap_err();
+    assert!(err.contains("Self-test adapter only permits explicitly allowed route"));
+}
+
+// 40. Self-test IPC disables HTTP redirects and halts immediately
+#[tokio::test]
+async fn test_40_self_test_ipc_rejects_redirects() {
+    use mlue_lib::{VerifyHttpApiRequest, execute_verify_http_api_call};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::MOVED_PERMANENTLY)
+                .header(axum::http::header::LOCATION, "http://1.1.1.1/evil")
+                .body(axum::body::Body::from(
+                    json!({
+                        "error": {
+                            "code": "redirect_attempt",
+                            "message": "Attempting redirect to remote"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        }),
+    );
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let req = VerifyHttpApiRequest {
+        endpoint: format!("http://127.0.0.1:{}", port),
+        api_key: "dummy_key".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: false,
+    };
+
+    let res = execute_verify_http_api_call(req, port).await.unwrap();
+    assert!(!res.success);
+    assert_eq!(res.http_status, 301);
+    let err = res.error.expect("Expected error for 301 redirect");
+    assert_eq!(err.http_status, 301);
+}
+
+// 41. Self-test IPC enforces non-streaming on verify_http_api_call
+#[tokio::test]
+async fn test_41_self_test_ipc_enforces_non_streaming() {
+    use mlue_lib::{VerifyHttpApiRequest, execute_verify_http_api_call};
+    let req = VerifyHttpApiRequest {
+        endpoint: "http://127.0.0.1:4782".to_string(),
+        api_key: "dummy".to_string(),
+        model: "auto".to_string(),
+        prompt: "hi".to_string(),
+        stream: true,
+    };
+    let err = execute_verify_http_api_call(req, 4782).await.unwrap_err();
+    assert!(err.contains("verify_http_api_call is non-streaming"));
+}
+
+// 42. Self-test IPC streaming channel and cancellation behavior
+#[tokio::test]
+async fn test_42_self_test_ipc_streaming_channel_and_cancellation() {
+    use mlue_lib::{VerifyHttpApiRequest, VerifyHttpStreamEvent, execute_verify_http_stream};
+    let fixture = TestFixture::new().await;
+    let proj = fixture
+        .project_service
+        .create_project("Stream Test Proj", None)
+        .await
+        .unwrap();
+    let key = fixture
+        .key_service
+        .create_key(&proj.id, "Stream Key", None)
+        .await
+        .unwrap();
+
+    let port = reqwest::Url::parse(&fixture.server_endpoint)
+        .unwrap()
+        .port()
+        .unwrap();
+
+    // 1. Successful stream
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VerifyHttpStreamEvent>();
+    let channel = tauri::ipc::Channel::new(move |body| {
+        if let tauri::ipc::InvokeResponseBody::Json(json_str) = body
+            && let Ok(event) = serde_json::from_str::<VerifyHttpStreamEvent>(&json_str)
+        {
+            let _ = tx.send(event);
+        }
+        Ok(())
+    });
+
+    let req = VerifyHttpApiRequest {
+        endpoint: fixture.server_endpoint.clone(),
+        api_key: key.full_key.clone(),
+        model: "auto".to_string(),
+        prompt: "Stream test".to_string(),
+        stream: true,
+    };
+
+    let req_id = "stream_test_req_1".to_string();
+    execute_verify_http_stream(
+        None,
+        fixture.inference_manager.clone(),
+        req,
+        req_id.clone(),
+        port,
+        channel,
+    )
+    .await
+    .unwrap();
+
+    let mut saw_delta = false;
+    let mut saw_completed = false;
+    while let Some(evt) = rx.recv().await {
+        match evt {
+            VerifyHttpStreamEvent::Delta { content, .. } => {
+                if !content.is_empty() {
+                    saw_delta = true;
+                }
+            }
+            VerifyHttpStreamEvent::Completed { .. } => {
+                saw_completed = true;
+                break;
+            }
+            VerifyHttpStreamEvent::Error { code, message, .. } => {
+                panic!("Unexpected error event: {} - {}", code, message);
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_delta, "Should have received at least one delta");
+    assert!(saw_completed, "Should have received completed event");
+
+    // 2. Cancellation of stream
+    let (cancel_tx, mut cancel_rx) =
+        tokio::sync::mpsc::unbounded_channel::<VerifyHttpStreamEvent>();
+    let cancel_channel = tauri::ipc::Channel::new(move |body| {
+        if let tauri::ipc::InvokeResponseBody::Json(json_str) = body
+            && let Ok(event) = serde_json::from_str::<VerifyHttpStreamEvent>(&json_str)
+        {
+            let _ = cancel_tx.send(event);
+        }
+        Ok(())
+    });
+
+    let cancel_req_id = "stream_cancel_req_2".to_string();
+    let cancel_req = VerifyHttpApiRequest {
+        endpoint: fixture.server_endpoint.clone(),
+        api_key: key.full_key.clone(),
+        model: "auto".to_string(),
+        prompt: "Slow stream".to_string(),
+        stream: true,
+    };
+
+    execute_verify_http_stream(
+        None,
+        fixture.inference_manager.clone(),
+        cancel_req,
+        cancel_req_id.clone(),
+        port,
+        cancel_channel,
+    )
+    .await
+    .unwrap();
+
+    // Trigger cancellation
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cancelled = fixture
+        .inference_manager
+        .cancel_request(&cancel_req_id, None);
+    assert!(cancelled, "Cancellation signal should be accepted");
+
+    let mut saw_cancelled = false;
+    while let Some(evt) = cancel_rx.recv().await {
+        if matches!(evt, VerifyHttpStreamEvent::Cancelled) {
+            saw_cancelled = true;
+            break;
+        }
+    }
+    assert!(saw_cancelled, "Should have received Cancelled event");
+
+    // Ensure capacity is released
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fixture.inference_manager.active_count(), 0);
 }

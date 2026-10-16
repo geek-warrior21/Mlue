@@ -128,7 +128,7 @@ pub struct VerifyHttpApiRequest {
     pub stream: bool,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerifyHttpApiResponse {
     pub success: bool,
     pub http_status: u16,
@@ -140,32 +140,60 @@ pub struct VerifyHttpApiResponse {
     pub error: Option<VerifyHttpApiError>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VerifyHttpApiError {
     pub code: String,
     pub message: String,
     pub http_status: u16,
 }
 
-/// Narrowly scoped self-test adapter: executes a real HTTP request across loopback
-/// to verify the live embedded gateway (/v1/chat/completions) without bypassing
-/// Bearer authentication, model authorization, or inference routing.
-#[tauri::command(rename_all = "snake_case")]
-async fn verify_http_api_call(
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VerifyHttpStreamEvent {
+    Delta {
+        content: String,
+        time_to_first_token_ms: Option<u64>,
+        model_used: Option<String>,
+    },
+    Usage {
+        usage: crate::inference::UsageInfo,
+    },
+    Completed {
+        content: String,
+        duration_ms: u64,
+        time_to_first_token_ms: Option<u64>,
+        usage: Option<crate::inference::UsageInfo>,
+        model_used: Option<String>,
+    },
+    Cancelled,
+    Error {
+        code: String,
+        message: String,
+        http_status: u16,
+    },
+}
+
+/// Executes non-streaming self-test verification against the local mlue gateway (/v1/chat/completions).
+/// Destination is strictly validated against the running mlue port; redirects are disabled.
+pub async fn execute_verify_http_api_call(
     request: VerifyHttpApiRequest,
+    expected_port: u16,
 ) -> Result<VerifyHttpApiResponse, String> {
-    let clean_endpoint = request.endpoint.trim().trim_end_matches('/');
-    // Security check: ensure endpoint is strictly loopback
-    if !clean_endpoint.starts_with("http://127.0.0.1:")
-        && !clean_endpoint.starts_with("http://localhost:")
-    {
+    if request.stream {
         return Err(
-            "Self-test adapter only permits loopback endpoints (127.0.0.1 / localhost)".to_string(),
+            "verify_http_api_call is non-streaming. Set stream: false or call start_verify_http_stream for real-time streaming."
+                .to_string(),
         );
     }
 
-    let url = format!("{}/v1/chat/completions", clean_endpoint);
+    let target_url = crate::api::security::validate_loopback_api_destination(
+        &request.endpoint,
+        expected_port,
+        "/v1/chat/completions",
+    )?;
+
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
@@ -173,13 +201,12 @@ async fn verify_http_api_call(
     let payload = serde_json::json!({
         "model": request.model,
         "messages": [{ "role": "user", "content": request.prompt }],
-        "stream": request.stream,
-        "stream_options": if request.stream { serde_json::json!({ "include_usage": true }) } else { serde_json::Value::Null },
+        "stream": false,
     });
 
     let start_time = std::time::Instant::now();
     let res = client
-        .post(&url)
+        .post(target_url.as_str())
         .header(
             reqwest::header::AUTHORIZATION,
             format!("Bearer {}", request.api_key),
@@ -196,9 +223,14 @@ async fn verify_http_api_call(
         let err_json: serde_json::Value = res.json().await.unwrap_or_default();
         let err_obj = &err_json["error"];
         let code = err_obj["code"].as_str().unwrap_or("HTTP_ERROR").to_string();
+        let default_msg = if matches!(status, 301 | 302 | 307 | 308) {
+            "Redirects are disabled for self-test verification"
+        } else {
+            "Request failed"
+        };
         let message = err_obj["message"]
             .as_str()
-            .unwrap_or("Request failed")
+            .unwrap_or(default_msg)
             .to_string();
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
@@ -218,95 +250,272 @@ async fn verify_http_api_call(
         });
     }
 
-    if !request.stream {
-        let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-        let duration_ms = start_time.elapsed().as_millis() as u64;
-        let model_used = body["model"].as_str().map(|s| s.to_string());
-        let content = body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let usage = if body["usage"].is_object() {
-            serde_json::from_value::<crate::inference::UsageInfo>(body["usage"].clone()).ok()
-        } else {
-            None
-        };
-
-        return Ok(VerifyHttpApiResponse {
-            success: true,
-            http_status: 200,
-            model_used,
-            content,
-            duration_ms,
-            time_to_first_token_ms: Some(duration_ms),
-            usage,
-            error: None,
-        });
-    }
-
-    // Streaming mode
-    use futures_util::StreamExt;
-    let mut stream = res.bytes_stream();
-    let mut time_to_first_token_ms: Option<u64> = None;
-    let mut accumulated_content = String::new();
-    let mut resolved_model: Option<String> = None;
-    let mut parsed_usage: Option<crate::inference::UsageInfo> = None;
-    let mut buffer = String::new();
-
-    while let Some(chunk_res) = stream.next().await {
-        let chunk = chunk_res.map_err(|e| e.to_string())?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        let mut lines: Vec<String> = buffer.split('\n').map(|s| s.to_string()).collect();
-        buffer = lines.pop().unwrap_or_default();
-
-        for line in lines {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(data_str) = line.strip_prefix("data:") {
-                let data_str = data_str.trim();
-                if data_str == "[DONE]" {
-                    continue;
-                }
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                    if resolved_model.is_none() {
-                        resolved_model = json["model"].as_str().map(|s| s.to_string());
-                    }
-                    if let Some(content_piece) = json
-                        .pointer("/choices/0/delta/content")
-                        .and_then(|c| c.as_str())
-                        && !content_piece.is_empty()
-                    {
-                        if time_to_first_token_ms.is_none() {
-                            time_to_first_token_ms = Some(start_time.elapsed().as_millis() as u64);
-                        }
-                        accumulated_content.push_str(content_piece);
-                    }
-                    if json["usage"].is_object() {
-                        parsed_usage = serde_json::from_value::<crate::inference::UsageInfo>(
-                            json["usage"].clone(),
-                        )
-                        .ok();
-                    }
-                }
-            }
-        }
-    }
-
+    let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
     let duration_ms = start_time.elapsed().as_millis() as u64;
+    let model_used = body["model"].as_str().map(|s| s.to_string());
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let usage = if body["usage"].is_object() {
+        serde_json::from_value::<crate::inference::UsageInfo>(body["usage"].clone()).ok()
+    } else {
+        None
+    };
 
     Ok(VerifyHttpApiResponse {
         success: true,
         http_status: 200,
-        model_used: resolved_model,
-        content: accumulated_content,
+        model_used,
+        content,
         duration_ms,
-        time_to_first_token_ms: time_to_first_token_ms.or(Some(duration_ms)),
-        usage: parsed_usage,
+        time_to_first_token_ms: Some(duration_ms),
+        usage,
         error: None,
     })
+}
+
+/// Executes streaming self-test verification using a bounded, cancellation-aware event channel.
+pub async fn execute_verify_http_stream(
+    window_label: Option<String>,
+    manager: Arc<InferenceManager>,
+    request: VerifyHttpApiRequest,
+    request_id: String,
+    expected_port: u16,
+    on_event: tauri::ipc::Channel<VerifyHttpStreamEvent>,
+) -> Result<(), String> {
+    let token = manager
+        .register_request(request_id.clone(), request.model.clone(), window_label)
+        .map_err(|e| e.to_string())?;
+
+    let target_url = crate::api::security::validate_loopback_api_destination(
+        &request.endpoint,
+        expected_port,
+        "/v1/chat/completions",
+    )?;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let manager_clone = manager.clone();
+    let req_id_clone = request_id.clone();
+    let token_clone = token.clone();
+
+    tauri::async_runtime::spawn(async move {
+        use futures_util::StreamExt;
+        let start_time = std::time::Instant::now();
+
+        let payload = serde_json::json!({
+            "model": request.model,
+            "messages": [{ "role": "user", "content": request.prompt }],
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+
+        let res = match client
+            .post(target_url.as_str())
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", request.api_key),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = on_event.send(VerifyHttpStreamEvent::Error {
+                    code: "HTTP_CONNECT_ERROR".to_string(),
+                    message: format!("Failed to connect to mlue gateway: {}", e),
+                    http_status: 502,
+                });
+                manager_clone.unregister_request(&req_id_clone);
+                return;
+            }
+        };
+
+        let status = res.status().as_u16();
+        if !res.status().is_success() {
+            let err_json: serde_json::Value = res.json().await.unwrap_or_default();
+            let err_obj = &err_json["error"];
+            let code = err_obj["code"].as_str().unwrap_or("HTTP_ERROR").to_string();
+            let default_msg = if matches!(status, 301 | 302 | 307 | 308) {
+                "Redirects are disabled for self-test verification"
+            } else {
+                "Request failed"
+            };
+            let message = err_obj["message"]
+                .as_str()
+                .unwrap_or(default_msg)
+                .to_string();
+
+            let _ = on_event.send(VerifyHttpStreamEvent::Error {
+                code,
+                message,
+                http_status: status,
+            });
+            manager_clone.unregister_request(&req_id_clone);
+            return;
+        }
+
+        let mut stream = res.bytes_stream();
+        let mut time_to_first_token_ms: Option<u64> = None;
+        let mut accumulated_content = String::new();
+        let mut resolved_model: Option<String> = None;
+        let mut parsed_usage: Option<crate::inference::UsageInfo> = None;
+        let mut buffer = String::new();
+
+        loop {
+            tokio::select! {
+                _ = token_clone.cancelled() => {
+                    let _ = on_event.send(VerifyHttpStreamEvent::Cancelled);
+                    break;
+                }
+                chunk_res = stream.next() => {
+                    match chunk_res {
+                        Some(Ok(chunk)) => {
+                            buffer.push_str(&String::from_utf8_lossy(&chunk));
+                            let mut lines: Vec<String> = buffer.split('\n').map(|s| s.to_string()).collect();
+                            buffer = lines.pop().unwrap_or_default();
+
+                            for line in lines {
+                                let line = line.trim();
+                                if line.is_empty() || line == "data: [DONE]" {
+                                    continue;
+                                }
+                                if let Some(data_str) = line.strip_prefix("data:") {
+                                    let data_str = data_str.trim();
+                                    if data_str == "[DONE]" {
+                                        continue;
+                                    }
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) {
+                                        if resolved_model.is_none() {
+                                            resolved_model = json["model"].as_str().map(|s| s.to_string());
+                                        }
+                                        if let Some(content_piece) = json
+                                            .pointer("/choices/0/delta/content")
+                                            .and_then(|c| c.as_str())
+                                            && !content_piece.is_empty()
+                                        {
+                                            if time_to_first_token_ms.is_none() {
+                                                time_to_first_token_ms = Some(start_time.elapsed().as_millis() as u64);
+                                            }
+                                            accumulated_content.push_str(content_piece);
+
+                                            if on_event.send(VerifyHttpStreamEvent::Delta {
+                                                content: content_piece.to_string(),
+                                                time_to_first_token_ms,
+                                                model_used: resolved_model.clone(),
+                                            }).is_err() {
+                                                // Receiver dropped / window closed
+                                                break;
+                                            }
+                                        }
+                                        if let Ok(u) = serde_json::from_value::<crate::inference::UsageInfo>(json["usage"].clone()) {
+                                            parsed_usage = Some(u.clone());
+                                            let _ = on_event.send(VerifyHttpStreamEvent::Usage { usage: u });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(err)) => {
+                            let _ = on_event.send(VerifyHttpStreamEvent::Error {
+                                code: "STREAM_READ_ERROR".to_string(),
+                                message: format!("Stream interrupted: {}", err),
+                                http_status: 500,
+                            });
+                            break;
+                        }
+                        None => {
+                            let duration_ms = start_time.elapsed().as_millis() as u64;
+                            let _ = on_event.send(VerifyHttpStreamEvent::Completed {
+                                content: accumulated_content,
+                                duration_ms,
+                                time_to_first_token_ms: time_to_first_token_ms.or(Some(duration_ms)),
+                                usage: parsed_usage,
+                                model_used: resolved_model,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        manager_clone.unregister_request(&req_id_clone);
+    });
+
+    Ok(())
+}
+
+/// Narrowly scoped self-test adapter: executes non-streaming HTTP verification.
+#[tauri::command(rename_all = "snake_case")]
+async fn verify_http_api_call(
+    app_state: State<'_, Arc<AppState>>,
+    request: VerifyHttpApiRequest,
+) -> Result<VerifyHttpApiResponse, String> {
+    let expected_port = {
+        let ep = app_state.get_status().endpoint;
+        reqwest::Url::parse(&ep)
+            .ok()
+            .and_then(|u| u.port())
+            .unwrap_or(crate::runtime::server::DEFAULT_PORT)
+    };
+    execute_verify_http_api_call(request, expected_port).await
+}
+
+/// Real-time streaming self-test adapter using a bounded, cancellation-aware event channel.
+#[tauri::command(rename_all = "snake_case")]
+async fn start_verify_http_stream(
+    window: tauri::Window,
+    manager: State<'_, Arc<InferenceManager>>,
+    app_state: State<'_, Arc<AppState>>,
+    request: VerifyHttpApiRequest,
+    request_id: String,
+    on_event: tauri::ipc::Channel<VerifyHttpStreamEvent>,
+) -> Result<(), String> {
+    let expected_port = {
+        let ep = app_state.get_status().endpoint;
+        reqwest::Url::parse(&ep)
+            .ok()
+            .and_then(|u| u.port())
+            .unwrap_or(crate::runtime::server::DEFAULT_PORT)
+    };
+
+    execute_verify_http_stream(
+        Some(window.label().to_string()),
+        manager.inner().clone(),
+        request,
+        request_id,
+        expected_port,
+        on_event,
+    )
+    .await
+}
+
+/// Cancels an in-flight verification request.
+#[tauri::command(rename_all = "snake_case")]
+fn cancel_verify_http_call(
+    window: tauri::Window,
+    manager: State<'_, Arc<InferenceManager>>,
+    request_id: String,
+) -> CancelResult {
+    let success = manager.cancel_request(&request_id, Some(window.label()));
+    let message = if success {
+        "Self-test verification cancellation signal dispatched".to_string()
+    } else {
+        "Self-test request not found, already completed, or window mismatch".to_string()
+    };
+    CancelResult {
+        success,
+        request_id,
+        message,
+    }
 }
 
 #[tauri::command]
@@ -530,7 +739,9 @@ pub fn run() {
             create_api_key,
             list_api_keys,
             revoke_api_key,
-            verify_http_api_call
+            verify_http_api_call,
+            start_verify_http_stream,
+            cancel_verify_http_call
         ])
         .setup(move |app| {
             let app_handle = app.handle().clone();

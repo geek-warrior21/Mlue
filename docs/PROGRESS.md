@@ -4,21 +4,37 @@
 
 ---
 
-### Milestone: Brick 4A — First-Run Onboarding & One-Click API Verification (Completed)
+### Milestone: Brick 4A — First-Run Onboarding & One-Click API Verification (Completed & Audited)
 
-#### 1. Implemented in Brick 4A
+#### 1. Implemented in Brick 4A & Task 010 Security & Streaming Audit
 - **First-Run Onboarding & Quickstart Flow (`src/App.tsx`)**:
   - Implemented collapsible quickstart section (`#onboarding-section`) with 4-step progress flow:
     - **Step 1: Local Model Detection**: Auto-detects local Ollama instance and models (e.g. `llama3.2:1b`), indicating real-time provider readiness.
     - **Step 2: Project Selection / Creation**: Allows user to select an existing project or initialize the default project with zero duplication on reloads.
     - **Step 3: Personal Key Armed State**: Guides the user to create or select a personal API key (`mlue_sk_...`) with one-time visible secret.
-    - **Step 4: Live HTTP API Verification**: Prominent "Test My API" button calling the real authenticated HTTP endpoint.
+    - **Step 4: Live HTTP API Verification**: Prominent "Test My API" button calling the real authenticated HTTP endpoint, with real-time "Stop Test" cancellation support.
 - **One-Click Real HTTP API Test Runner (`handleTestApi`)**:
-  - Calls `http://127.0.0.1:4782/v1/chat/completions` directly using browser `fetch()` with `Authorization: Bearer <key>`.
+  - Calls `http://127.0.0.1:4782/v1/chat/completions` directly using browser `fetch()` with `Authorization: Bearer <key>` and `AbortController`.
   - Strictly avoids internal Tauri IPC shortcuts to ensure true HTTP boundary validation.
   - Supports both streaming SSE (`ReadableStreamDefaultReader` parsing `data: ...` frames) and non-streaming modes.
   - Real-time performance measurement: calculates Time-To-First-Token (TTFT) and total generation duration (latency) using `performance.now()`.
   - Parses streaming and non-streaming usage chunks (`prompt_tokens`, `completion_tokens`, `total_tokens`).
+- **Hardened Tauri IPC Self-Test Adapters (`lib.rs`, `security.rs`)**:
+  - `verify_http_api_call`: Strictly non-streaming verification endpoint; immediately rejects requests with `stream: true`.
+  - `start_verify_http_stream`: Real-time streaming verification using a bounded, cancellation-aware event channel (`tauri::ipc::Channel<VerifyHttpStreamEvent>`).
+  - `cancel_verify_http_call`: Immediate cancellation command that signals `InferenceManager::cancel_request` to drop upstream connection and free concurrency capacity.
+  - **Strict Destination Validation (`validate_loopback_api_destination`)**:
+    - Scheme must be strictly `http://`.
+    - Zero userinfo / credentials in URL.
+    - Host must be strictly loopback (`127.0.0.1` or `localhost`).
+    - Port must exactly match the running mlue service port (default `4782`).
+    - Path must match allowed route (`/v1/chat/completions`), canonicalized safely.
+    - Query parameters and URL fragments are forbidden.
+  - **Redirect Prevention**: Configured `reqwest::redirect::Policy::none()`. Any 3xx redirect response is immediately halted without following.
+- **Browser-Origin Rules in Debug vs. Release (`security.rs`)**:
+  - In release mode (`is_debug = false`), only exact packaged Tauri schemes (`tauri://localhost`, `http://tauri.localhost`) are permitted.
+  - In development mode (`is_debug = true`), Vite dev ports (`http://localhost:1420`, `http://127.0.0.1:1420`) are additionally permitted.
+  - Arbitrary localhost ports (`http://localhost:8080`) and external domains are rejected across all environments.
 - **Developer Integration Code Examples**:
   - Interactive multi-tab snippet viewer (`#code-snippet-preview`):
     - Python (Streaming using official `openai` SDK v1.x)
@@ -27,22 +43,17 @@
     - cURL (Sync JSON)
   - Dynamically populates local port, active key (or placeholder), and detected model name.
   - One-click copy snippet button (`#copy-snippet-btn`).
-- **Comprehensive Failure Diagnostics**:
-  - Actionable error cards diagnosing:
-    - HTTP 401: Invalid, missing, or revoked API key (`invalid_api_key`)
-    - HTTP 404: Model not found or unregistered (`model_not_found`)
-    - HTTP 429 / 503: Concurrency capacity limit (`capacity_exceeded`)
-    - HTTP 502: Upstream Ollama instance offline or unreachable
-- **Automated Integration Test Suite (`tests/http_inference_and_auth_tests.rs`)**:
-  - Added test 33: CORS preflight requests from browser/webview origins (`http://localhost:1420`, `tauri://localhost`, `http://tauri.localhost`) succeed with HTTP 200 and correct CORS headers.
-  - Added test 34: Untrusted browser Origin (`http://evil-attacker-site.com`) is rejected with HTTP 403 `untrusted_origin`.
-  - Added test 35: Onboarding persistence ensures no duplicate projects or silent key leaks to disk.
-  - Added test 36: One-click verification calls real HTTP `/v1/chat/completions` endpoint and returns valid responses and usage envelopes.
-  - Added test 37: Arbitrary localhost origins (`http://localhost:8080`, `http://localhost:3000`, `http://127.0.0.1:8000`) are rejected with HTTP 403 `untrusted_origin`.
-  - Added test 38: Untrusted Host headers (`attacker.com`, `evil.org:4782`, `192.168.1.50`) are rejected with HTTP 400 `invalid_host`.
-- **Tauri IPC Loopback Self-Test Adapter (`verify_http_api_call`)**:
-  - Provides a narrowly scoped self-test adapter that makes a real authenticated HTTP request to the loopback gateway (`http://127.0.0.1:4782/v1/chat/completions`) using `reqwest`.
-  - Guarantees seamless verification in packaged macOS WebViews if cross-scheme `fetch()` is restricted by WebKit policies, while strictly enforcing real Bearer auth and full model routing.
+- **Automated Integration & Security Test Suite (`tests/http_inference_and_auth_tests.rs`)**:
+  - Test 33: CORS preflight requests from browser/webview origins succeed with HTTP 200.
+  - Test 34: Untrusted browser Origin (`http://evil-attacker-site.com`) is rejected with HTTP 403 `untrusted_origin`.
+  - Test 35: Onboarding persistence ensures no duplicate projects or silent key leaks to disk.
+  - Test 36: One-click verification calls real HTTP `/v1/chat/completions` endpoint and returns valid responses and usage envelopes.
+  - Test 37: Arbitrary localhost origins (`http://localhost:8080`, `http://localhost:3000`, `http://127.0.0.1:8000`) are rejected with HTTP 403 `untrusted_origin`.
+  - Test 38: Untrusted Host headers (`attacker.com`, `evil.org:4782`, `192.168.1.50`) are rejected with HTTP 400 `invalid_host`.
+  - Test 39: Self-test IPC destination restrictions enforce scheme, loopback, exact port, no userinfo, allowed route, and no query/fragment.
+  - Test 40: Self-test IPC disables HTTP redirects and halts immediately.
+  - Test 41: Self-test IPC enforces non-streaming on `verify_http_api_call`.
+  - Test 42: Self-test IPC streaming channel and cancellation behavior.
 
 #### 2. Empirical Validation & Testing
 - **Real-Model Evidence (`llama3.2:1b` on Apple Silicon)**:
@@ -52,40 +63,35 @@
   - **Non-Streaming Inference (`POST /v1/chat/completions`, `stream: false`)**:
     - Query: "Explain why local AI gives users data sovereignty in one sentence."
     - Output: "Local AI, by processing and storing data within a specific region or country, enables users to maintain control over their personal data and exercise data sovereignty, allowing them to decide how and to whom their data is shared."
-    - Tokens: 38 prompt + 43 completion = 81 total tokens
-    - Total Latency: **2.08s**
+    - Tokens: 38 prompt + 43 completion = 81 total tokens; Latency: **2.08s**
   - **Streaming SSE Inference (`POST /v1/chat/completions`, `stream: true`)**:
     - Query: "Count from 1 to 5 with commas."
     - Output: "Here is the count from 1 to 5 with commas:\n\n1, 2, 3, 4, 5"
-    - Tokens: 35 prompt + 27 completion = 62 total tokens
-    - Total Latency: **0.46s (463ms)**
+    - Tokens: 35 prompt + 27 completion = 62 total tokens; Latency: **0.46s (463ms)**
   - **Official OpenAI Python SDK (`openai` v1.x via `scratch_pyenv/bin/python3`)**:
     - Sync test ("What is the capital of France? One word."): **0.108s** latency -> `"Paris."`
     - Streaming test ("Say hello world in Python code block."): **TTFT: 0.030s (30ms)**, Total: **0.593s** -> code block output.
-  - **Security Boundary Tests**:
-    - Invalid API key -> HTTP 401 `invalid_api_key`
-    - Non-existent model -> HTTP 404 `model_not_found`
-    - Untrusted Origin (`http://malicious-website.com`, `http://localhost:8080`) -> HTTP 403 `untrusted_origin`
-    - Untrusted Host (`attacker.domain.com`) -> HTTP 400 `invalid_host`
-    - Webview Origin (`http://localhost:1420`, `tauri://localhost`) -> HTTP 200 OK (CORS preflight allowed)
 - **Automated Regression Suite**:
   - `cargo fmt --check`: Clean (0 diffs).
   - `cargo clippy --all-targets -- -D warnings`: Clean (0 warnings across all targets).
-  - `cargo test`: **113 passed, 0 failed** across all test suites:
-    - `http_inference_and_auth_tests.rs`: 37 passed
+  - `cargo test`: **121 passed, 0 failed** across all test suites:
+    - `http_inference_and_auth_tests.rs`: 41 passed
     - `persistence_and_auth_tests.rs`: 18 passed
     - `streaming_tests.rs`: 22 passed
     - `inference_tests.rs`: 17 passed
     - `ollama_discovery_tests.rs`: 10 passed
     - `server_tests.rs`: 6 passed
-    - `mlue_lib` unit tests (including security Host/Origin): 3 passed
-  - `npm run build`: Production bundle built cleanly (0 errors, 534ms).
-  - `npm run tauri build -- --debug`: Successfully packaged macOS native application (`mlue.app`, 52.87 MiB) and DMG installer (`mlue_0.1.0_aarch64.dmg`, 12.54 MiB).
+    - `mlue_lib` unit tests (including security Host/Origin/Destination): 7 passed
+  - `npm run build`: Production bundle built cleanly (0 errors, 567ms).
+  - `npm run tauri build -- --debug`: Successfully packaged macOS native application (`mlue.app`, 53.15 MiB) and DMG installer (`mlue_0.1.0_aarch64.dmg`, 12.59 MiB).
+- **Database Safety Verification**:
+  - Confirmed live user database at `~/Library/Application Support/app.mlue.desktop/mlue.db` was untouched and never seeded with test keys or mock credentials. All tests ran against ephemeral in-memory/temp SQLite pools.
 
 #### 3. Known Blockers
 - None.
 
 #### 4. Outstanding Work (Next Milestones)
+- **Alpha GUI Acceptance**: Awaiting human GUI acceptance results on the packaged desktop build before declaring alpha-ready.
 - **Brick 4B**: Additional local engine adapters (e.g. LM Studio, llama.cpp, vLLM) and model management controls.
 - **Remote Access (Future Milestone)**: Optional authenticated remote connectivity (e.g. Tailscale / wireguard).
 

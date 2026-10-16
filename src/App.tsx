@@ -126,6 +126,46 @@ export interface ApiTestResult {
   } | null;
 }
 
+export type VerifyHttpStreamEvent =
+  | {
+      type: "delta";
+      content: string;
+      time_to_first_token_ms: number | null;
+      model_used: string | null;
+    }
+  | {
+      type: "usage";
+      usage: UsageInfo;
+    }
+  | {
+      type: "completed";
+      content: string;
+      duration_ms: number;
+      time_to_first_token_ms: number | null;
+      usage?: UsageInfo | null;
+      model_used: string | null;
+    }
+  | {
+      type: "cancelled";
+    }
+  | {
+      type: "error";
+      code: string;
+      message: string;
+      http_status: number;
+    };
+
+export interface VerifyHttpApiResponse {
+  success: boolean;
+  http_status: number;
+  model_used: string | null;
+  content: string;
+  duration_ms: number;
+  time_to_first_token_ms: number | null;
+  usage: UsageInfo | null;
+  error: { code: string; message: string; http_status: number } | null;
+}
+
 export type CodeSnippetTab = "python_stream" | "python_sync" | "curl_stream" | "curl_sync";
 
 function getIntegrationSnippet(
@@ -293,6 +333,9 @@ export default function App() {
   const activeRequestIdRef = useRef<string | null>(null);
   const contentBufferRef = useRef<string>("");
   const batchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const activeApiTestAbortRef = useRef<AbortController | null>(null);
+  const activeApiTestRequestIdRef = useRef<string | null>(null);
 
   // Fetch Runtime Status via IPC
   const fetchStatus = useCallback(async () => {
@@ -709,8 +752,12 @@ export default function App() {
     const targetModel = selectedModelId || "auto";
     const userPrompt = apiTestPrompt.trim() || "Explain why local AI gives users data sovereignty in two sentences.";
 
-    try {
+    const abortController = new AbortController();
+    activeApiTestAbortRef.current = abortController;
+    const testReqId = `test_http_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    activeApiTestRequestIdRef.current = testReqId;
 
+    try {
       const res = await fetch(`${endpointUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
@@ -723,6 +770,7 @@ export default function App() {
           stream: apiTestStreaming,
           ...(apiTestStreaming ? { stream_options: { include_usage: true } } : {}),
         }),
+        signal: abortController.signal,
       });
 
       if (!res.ok) {
@@ -748,6 +796,8 @@ export default function App() {
           },
         });
         setIsTestingApi(false);
+        activeApiTestRequestIdRef.current = null;
+        activeApiTestAbortRef.current = null;
         return;
       }
 
@@ -765,6 +815,8 @@ export default function App() {
           error: null,
         });
         setIsTestingApi(false);
+        activeApiTestRequestIdRef.current = null;
+        activeApiTestAbortRef.current = null;
         return;
       }
 
@@ -834,61 +886,209 @@ export default function App() {
         usage: usageData,
         error: null,
       });
+      setIsTestingApi(false);
+      activeApiTestRequestIdRef.current = null;
+      activeApiTestAbortRef.current = null;
     } catch (err: any) {
+      if (err?.name === "AbortError") {
+        setApiTestResult({
+          status: "error",
+          httpStatus: 499,
+          modelUsed: null,
+          content: accumulatedContent,
+          durationMs: Math.round(performance.now() - startTime),
+          timeToFirstTokenMs: timeToFirstToken,
+          usage: null,
+          error: {
+            code: "REQUEST_CANCELLED",
+            message: "HTTP API verification request was cancelled.",
+            httpStatus: 499,
+          },
+        });
+        setIsTestingApi(false);
+        activeApiTestRequestIdRef.current = null;
+        activeApiTestAbortRef.current = null;
+        return;
+      }
+
       // If browser fetch failed (e.g. cross-scheme or mixed-content restriction in packaged WKWebView),
       // seamlessly execute via the Tauri IPC self-test adapter which makes the real authenticated HTTP request across loopback
       if (isTauri()) {
-        try {
-          const ipcRes = await invoke<{
-            success: boolean;
-            http_status: number;
-            model_used: string | null;
-            content: string;
-            duration_ms: number;
-            time_to_first_token_ms: number | null;
-            usage: UsageInfo | null;
-            error: { code: string; message: string; http_status: number } | null;
-          }>("verify_http_api_call", {
-            request: {
-              endpoint: endpointUrl,
-              api_key: keyToUse,
-              model: targetModel,
-              prompt: userPrompt,
-              stream: apiTestStreaming,
-            },
-          });
+        if (apiTestStreaming) {
+          try {
+            let usageData: UsageInfo | null = null;
+            let resolvedModel = targetModel;
 
-          if (ipcRes.success) {
-            setApiTestResult({
-              status: "success",
-              httpStatus: ipcRes.http_status,
-              modelUsed: ipcRes.model_used || targetModel,
-              content: ipcRes.content,
-              durationMs: ipcRes.duration_ms,
-              timeToFirstTokenMs: ipcRes.time_to_first_token_ms,
-              usage: ipcRes.usage,
-              error: null,
+            const channel = new Channel<VerifyHttpStreamEvent>((event) => {
+              switch (event.type) {
+                case "delta": {
+                  if (timeToFirstToken === null) {
+                    timeToFirstToken =
+                      event.time_to_first_token_ms ??
+                      Math.round(performance.now() - startTime);
+                  }
+                  if (event.model_used) resolvedModel = event.model_used;
+                  accumulatedContent += event.content;
+                  setApiTestResult({
+                    status: "running",
+                    httpStatus: 200,
+                    modelUsed: resolvedModel,
+                    content: accumulatedContent,
+                    durationMs: Math.round(performance.now() - startTime),
+                    timeToFirstTokenMs: timeToFirstToken,
+                    usage: usageData,
+                    error: null,
+                  });
+                  break;
+                }
+                case "usage": {
+                  usageData = event.usage;
+                  setApiTestResult((prev) => (prev ? { ...prev, usage: event.usage } : null));
+                  break;
+                }
+                case "completed": {
+                  const totalDuration = event.duration_ms;
+                  setApiTestResult({
+                    status: "success",
+                    httpStatus: 200,
+                    modelUsed: event.model_used || resolvedModel,
+                    content: event.content || accumulatedContent,
+                    durationMs: totalDuration,
+                    timeToFirstTokenMs: event.time_to_first_token_ms ?? timeToFirstToken,
+                    usage: event.usage || usageData,
+                    error: null,
+                  });
+                  setIsTestingApi(false);
+                  activeApiTestRequestIdRef.current = null;
+                  activeApiTestAbortRef.current = null;
+                  break;
+                }
+                case "cancelled": {
+                  setApiTestResult({
+                    status: "error",
+                    httpStatus: 499,
+                    modelUsed: null,
+                    content: accumulatedContent,
+                    durationMs: Math.round(performance.now() - startTime),
+                    timeToFirstTokenMs: timeToFirstToken,
+                    usage: usageData,
+                    error: {
+                      code: "REQUEST_CANCELLED",
+                      message: "HTTP API verification request was cancelled.",
+                      httpStatus: 499,
+                    },
+                  });
+                  setIsTestingApi(false);
+                  activeApiTestRequestIdRef.current = null;
+                  activeApiTestAbortRef.current = null;
+                  break;
+                }
+                case "error": {
+                  setApiTestResult({
+                    status: "error",
+                    httpStatus: event.http_status,
+                    modelUsed: null,
+                    content: accumulatedContent,
+                    durationMs: Math.round(performance.now() - startTime),
+                    timeToFirstTokenMs: null,
+                    usage: usageData,
+                    error: {
+                      code: event.code,
+                      message: event.message,
+                      httpStatus: event.http_status,
+                    },
+                  });
+                  setIsTestingApi(false);
+                  activeApiTestRequestIdRef.current = null;
+                  activeApiTestAbortRef.current = null;
+                  break;
+                }
+              }
+            });
+
+            await invoke("start_verify_http_stream", {
+              request: {
+                endpoint: endpointUrl,
+                api_key: keyToUse,
+                model: targetModel,
+                prompt: userPrompt,
+                stream: true,
+              },
+              request_id: testReqId,
+              on_event: channel,
             });
             return;
-          } else if (ipcRes.error) {
+          } catch (ipcErr: any) {
             setApiTestResult({
               status: "error",
-              httpStatus: ipcRes.http_status,
+              httpStatus: 500,
               modelUsed: null,
               content: "",
-              durationMs: ipcRes.duration_ms,
+              durationMs: Math.round(performance.now() - startTime),
               timeToFirstTokenMs: null,
               usage: null,
               error: {
-                code: ipcRes.error.code,
-                message: ipcRes.error.message,
-                httpStatus: ipcRes.error.http_status,
+                code: "IPC_STREAM_FAILED",
+                message: ipcErr?.message || String(ipcErr),
+                httpStatus: 500,
               },
             });
+            setIsTestingApi(false);
+            activeApiTestRequestIdRef.current = null;
+            activeApiTestAbortRef.current = null;
             return;
           }
-        } catch {
-          // Fall through to generic network error below
+        } else {
+          // Non-streaming verification
+          try {
+            const ipcRes = await invoke<VerifyHttpApiResponse>("verify_http_api_call", {
+              request: {
+                endpoint: endpointUrl,
+                api_key: keyToUse,
+                model: targetModel,
+                prompt: userPrompt,
+                stream: false,
+              },
+            });
+
+            if (ipcRes.success) {
+              setApiTestResult({
+                status: "success",
+                httpStatus: ipcRes.http_status,
+                modelUsed: ipcRes.model_used || targetModel,
+                content: ipcRes.content,
+                durationMs: ipcRes.duration_ms,
+                timeToFirstTokenMs: ipcRes.time_to_first_token_ms,
+                usage: ipcRes.usage,
+                error: null,
+              });
+              setIsTestingApi(false);
+              activeApiTestRequestIdRef.current = null;
+              activeApiTestAbortRef.current = null;
+              return;
+            } else if (ipcRes.error) {
+              setApiTestResult({
+                status: "error",
+                httpStatus: ipcRes.http_status,
+                modelUsed: null,
+                content: "",
+                durationMs: ipcRes.duration_ms,
+                timeToFirstTokenMs: null,
+                usage: null,
+                error: {
+                  code: ipcRes.error.code,
+                  message: ipcRes.error.message,
+                  httpStatus: ipcRes.error.http_status,
+                },
+              });
+              setIsTestingApi(false);
+              activeApiTestRequestIdRef.current = null;
+              activeApiTestAbortRef.current = null;
+              return;
+            }
+          } catch {
+            // Fall through to generic network error below
+          }
         }
       }
 
@@ -905,12 +1105,44 @@ export default function App() {
           message: err?.message || "Failed to connect to local mlue HTTP server. Ensure mlue is running on 127.0.0.1:4782.",
         },
       });
-    } finally {
       setIsTestingApi(false);
+      activeApiTestRequestIdRef.current = null;
+      activeApiTestAbortRef.current = null;
     }
   };
 
-  // Cancel active inference operation
+  // Cancel active Onboarding API verification test
+  const handleStopTestApi = useCallback(async () => {
+    if (activeApiTestAbortRef.current) {
+      activeApiTestAbortRef.current.abort();
+      activeApiTestAbortRef.current = null;
+    }
+    const reqId = activeApiTestRequestIdRef.current;
+    if (reqId && isTauri()) {
+      try {
+        await invoke("cancel_verify_http_call", { request_id: reqId });
+      } catch (err) {
+        console.error("Cancel API test failed:", err);
+      }
+      activeApiTestRequestIdRef.current = null;
+    }
+    setIsTestingApi(false);
+    setApiTestResult((prev) =>
+      prev
+        ? {
+            ...prev,
+            status: "error",
+            error: {
+              code: "REQUEST_CANCELLED",
+              message: "HTTP API verification request was cancelled.",
+              httpStatus: 499,
+            },
+          }
+        : null
+    );
+  }, []);
+
+  // Cancel active inference operation in Playground
   const handleCancel = useCallback(async () => {
     const reqId = activeRequestIdRef.current;
     if (!reqId) return;
@@ -924,11 +1156,17 @@ export default function App() {
     }
   }, []);
 
-  // Cleanup active request handling on unmount
+  // Cleanup active requests on unmount
   useEffect(() => {
     return () => {
       if (activeRequestIdRef.current && isTauri()) {
         invoke("cancel_test_completion", { request_id: activeRequestIdRef.current }).catch(() => {});
+      }
+      if (activeApiTestAbortRef.current) {
+        activeApiTestAbortRef.current.abort();
+      }
+      if (activeApiTestRequestIdRef.current && isTauri()) {
+        invoke("cancel_verify_http_call", { request_id: activeApiTestRequestIdRef.current }).catch(() => {});
       }
       if (batchTimerRef.current) {
         clearTimeout(batchTimerRef.current);
@@ -1540,27 +1778,39 @@ export default function App() {
                     <span>Stream Response via Server-Sent Events (SSE)</span>
                   </label>
 
-                  <button
-                    id="test-my-api-btn"
-                    onClick={handleTestApi}
-                    disabled={isTestingApi || (!activeTestApiKey && !createdKeyData?.full_key)}
-                    className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-lg text-xs font-semibold cursor-pointer transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-indigo-900/30 flex items-center justify-center gap-2"
-                  >
-                    {isTestingApi ? (
-                      <>
-                        <svg className="w-3.5 h-3.5 animate-spin text-white" viewBox="0 0 24 24" fill="none">
-                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                        </svg>
-                        <span>Testing Live HTTP API...</span>
-                      </>
-                    ) : (
-                      <>
-                        <span>⚡</span>
-                        <span>Test My API</span>
-                      </>
+                  <div className="flex items-center gap-2">
+                    {isTestingApi && (
+                      <button
+                        id="cancel-api-test-btn"
+                        onClick={handleStopTestApi}
+                        className="px-3.5 py-2 bg-rose-600/90 hover:bg-rose-500 text-white rounded-lg text-xs font-semibold cursor-pointer transition-all flex items-center justify-center gap-1.5 shadow-md shadow-rose-900/30"
+                      >
+                        <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+                        <span>Stop Test</span>
+                      </button>
                     )}
-                  </button>
+                    <button
+                      id="test-my-api-btn"
+                      onClick={handleTestApi}
+                      disabled={isTestingApi || (!activeTestApiKey && !createdKeyData?.full_key)}
+                      className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white rounded-lg text-xs font-semibold cursor-pointer transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-indigo-900/30 flex items-center justify-center gap-2"
+                    >
+                      {isTestingApi ? (
+                        <>
+                          <svg className="w-3.5 h-3.5 animate-spin text-white" viewBox="0 0 24 24" fill="none">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                          </svg>
+                          <span>Testing Live HTTP API...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>⚡</span>
+                          <span>Test My API</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {/* API Test Results Card */}

@@ -695,20 +695,37 @@ Brick 4A introduces a unified first-run user onboarding flow and an instant one-
 ### 10.1 Architectural Invariants & Verification Guarantees
 1. **Real HTTP Verification & Narrowly Scoped Loopback Self-Test Adapter**:
    - The "Test My API" button in the frontend initiates verification against `http://127.0.0.1:4782/v1/chat/completions`.
-   - In environments where browser `window.fetch()` directly executes cross-origin requests, it does so cleanly.
-   - For packaged macOS WebViews running under custom URI schemes (`tauri://localhost`), WebKit security policies can restrict direct cross-scheme fetch calls to loopback HTTP. To guarantee 100% test fidelity without bypassing authentication or routing, `mlue` provides a narrowly scoped Tauri IPC command `verify_http_api_call`.
-   - This adapter makes a genuine HTTP request via `reqwest` to the loopback gateway with real Bearer headers, exercising the exact same Axum routing, API key SHA-256 verification, model access control, and SSE chunk parsers.
-   - It strictly rejects non-loopback URLs and does NOT call internal inference engine IPCs directly.
-2. **Idempotent Setup Without Auto-Duplication**:
+   - In environments where browser `window.fetch()` directly executes cross-origin requests, it does so cleanly with full AbortController support.
+   - For packaged macOS WebViews running under custom URI schemes (`tauri://localhost`), WebKit security policies can restrict direct cross-scheme fetch calls to loopback HTTP. To guarantee 100% test fidelity without bypassing authentication or routing, `mlue` provides hardened Tauri IPC adapters:
+     - `verify_http_api_call`: Strictly non-streaming verification endpoint. Rejects requests with `stream: true`.
+     - `start_verify_http_stream`: Real-time streaming verification endpoint using a bounded, cancellation-aware event channel (`tauri::ipc::Channel<VerifyHttpStreamEvent>`).
+     - `cancel_verify_http_call`: Instant cancellation command that terminates active verification streams and releases concurrency permits.
+2. **IPC Destination Restrictions & Redirect Halting**:
+   - Destination URLs are rigorously audited by `validate_loopback_api_destination`:
+     - Scheme must be strictly `http://` (rejects `https://`, `ftp://`, `file://`).
+     - Rejects any embedded credentials / userinfo (`user:pass@`).
+     - Host must strictly be loopback (`127.0.0.1` or `localhost`). Remote/LAN IPs and hostnames are rejected.
+     - Port must exactly match the running mlue service port (default `4782`). Arbitrary localhost ports (`8080`, `11434`) are rejected.
+     - Path is restricted to empty, `/`, or the allowed route (`/v1/chat/completions` or `/v1`), canonicalizing to `/v1/chat/completions`. Arbitrary paths like `/admin` or path traversal sequences are rejected.
+     - Query strings and URL fragments are forbidden.
+   - HTTP redirects are disabled via `reqwest::redirect::Policy::none()`. Any 3xx redirect response is immediately halted and returned as an error envelope without traversing target URLs.
+3. **Browser Origin Validation in Debug vs. Release**:
+   - In production builds (`release`), only exact packaged Tauri origins (`tauri://localhost` and `http://tauri.localhost`) are permitted.
+   - In development mode (`debug_assertions`), exact Vite dev origins (`http://localhost:1420` and `http://127.0.0.1:1420`) are additionally permitted.
+   - Arbitrary localhost origins (e.g. `http://localhost:8080`) and external domains are rejected across all environments.
+4. **Cancellation and Component Cleanup**:
+   - Active verification requests are tracked by unique request IDs in `InferenceManager`.
+   - Client cancellation ("Stop Test" button) and React component unmount immediately abort active browser `fetch()` and dispatch `cancel_verify_http_call` IPC, terminating upstream connections and reclaiming concurrency capacity.
+5. **Idempotent Setup Without Auto-Duplication**:
    - The onboarding component does NOT perform automatic entity creation in `useEffect` or mount handlers.
    - If no project exists, the user is presented with a single explicit creation action. Subsequent reloads detect existing projects and bind to the active selection without duplicate database records.
-3. **Secret Hygiene**:
+6. **Secret Hygiene**:
    - Full plaintext keys (`mlue_sk_...`) exist only in transient React component state for testing and copying.
    - Plaintext keys are never written to SQLite, localStorage, or IPC logs.
-4. **Live Latency & Token Diagnostics**:
+7. **Live Latency & Token Diagnostics**:
    - Time-To-First-Token (TTFT) and total request duration are measured using high-precision performance timers (`performance.now()`).
    - Token metrics (`prompt_tokens`, `completion_tokens`, `total_tokens`) are parsed from streaming usage chunks and displayed in real time.
-5. **Copy-Ready Developer Integration Examples**:
+8. **Copy-Ready Developer Integration Examples**:
    - Generates fully populated, working snippets for Python (using official `openai` SDK v1.x with streaming and sync modes) and cURL (streaming SSE and sync JSON) with dynamic endpoints and key references.
 
 
